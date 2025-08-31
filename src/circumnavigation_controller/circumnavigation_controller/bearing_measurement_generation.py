@@ -55,10 +55,10 @@ class YoloImageNode(Node):
         # Load YOLO11n PyTorch model
         self.model = YOLO('yolo11n.pt')
         self.model.verbose = False
-        # Export to NCNN format if not already exported
+        # Export to NCNN format with lower resolution if not already exported
         ncnn_export_path = 'yolo11n_ncnn_model'
         if not os.path.exists(ncnn_export_path):
-            self.model.export(format='ncnn')
+            self.model.export(format='ncnn', imgsz=320)
         # Load the exported NCNN model
         self.ncnn_model = YOLO(ncnn_export_path)
         if self.show_debug_window:
@@ -67,8 +67,8 @@ class YoloImageNode(Node):
         # Current quadcopter yaw (heading) in radians
         self.current_yaw = 0.0
         # Camera parameters
-        self.image_width = 640
-        self.image_height = 480
+        self.image_width = 320
+        self.image_height = 320
         self.camera_fov_horizontal = 2.0  # Camera FOV in radians
 
         # If using topic, subscribe to image topic
