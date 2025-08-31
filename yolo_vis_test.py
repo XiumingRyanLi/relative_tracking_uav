@@ -9,7 +9,7 @@ os.environ["OV_CPU_THREADS_NUM"] = "2"
 os.environ["OMP_NUM_THREADS"] = "2"
 # ----------------------------------
 
-MODEL_PATH = "/home/mitchell/Documents/PhD/circumnavigation_ws/yolo11n_openvino_model"  # folder or .xml
+MODEL_PATH = "yolo11n_openvino_model"  # folder or .xml
 CAM_INDEX  = 0
 IMGSZ      = 256       # try 160 if you still see instability
 SHOW_WIN   = True      # flip False to test headless

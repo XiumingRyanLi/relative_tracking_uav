@@ -53,7 +53,7 @@ class YoloImageNode(Node):
         import warnings
         warnings.filterwarnings("ignore")
         # Load YOLO11n NCNN model from absolute path provided by user
-        self.ncnn_model = YOLO('/home/mitchell/Documents/PhD/circumnavigation_ws/yolo11n_ncnn_model')
+        self.ncnn_model = YOLO('/home/case/circumnavigation_ws/yolo11n_openvino_model')
         if self.show_debug_window:
             cv2.namedWindow('RealSense', cv2.WINDOW_AUTOSIZE)
 

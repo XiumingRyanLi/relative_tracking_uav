@@ -10,8 +10,8 @@ def generate_launch_description():
             output='screen',
             parameters=[
                 {'image_source': 'webcam', 'webcam_index': 0},
-                {'show_debug_window': True},
-                {'enable_debug_publish': True}
+                {'show_debug_window': False},
+                {'enable_debug_publish': False}
             ]
         ),
         Node(
