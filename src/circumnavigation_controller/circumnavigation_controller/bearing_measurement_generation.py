@@ -52,8 +52,15 @@ class YoloImageNode(Node):
         self.bridge = CvBridge()
         import warnings
         warnings.filterwarnings("ignore")
-        self.model = YOLO('yolov8n.pt')
+        # Load YOLO11n PyTorch model
+        self.model = YOLO('yolo11n.pt')
         self.model.verbose = False
+        # Export to NCNN format if not already exported
+        ncnn_export_path = 'yolo11n_ncnn_model'
+        if not os.path.exists(ncnn_export_path):
+            self.model.export(format='ncnn')
+        # Load the exported NCNN model
+        self.ncnn_model = YOLO(ncnn_export_path)
         if self.show_debug_window:
             cv2.namedWindow('RealSense', cv2.WINDOW_AUTOSIZE)
 
@@ -132,19 +139,18 @@ class YoloImageNode(Node):
         """Process image and detect person, calculate bearing"""
         print("image callback")
         frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-        
-        # Run YOLO inference with verbose=False
-        results = self.model(frame, verbose=False)
+        # Run YOLO inference with NCNN model
+        results = self.ncnn_model(frame, verbose=False)
         annotated_frame = results[0].plot()
-        
+
         # Store image dimensions
         self.image_height, self.image_width = frame.shape[:2]
-        
+
         # Always draw current heading on image
         heading_degrees = np.degrees(self.current_yaw)
         cv2.putText(annotated_frame, f'Heading: {heading_degrees:.1f}°', 
                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
-        
+
         # Look for person detections (class 0 in COCO dataset)
         person_detected = False
         for result in results:
