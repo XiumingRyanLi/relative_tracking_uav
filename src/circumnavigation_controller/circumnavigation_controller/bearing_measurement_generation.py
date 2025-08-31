@@ -52,8 +52,8 @@ class YoloImageNode(Node):
         self.bridge = CvBridge()
         import warnings
         warnings.filterwarnings("ignore")
-        # Load YOLO11n NCNN model directly (must be present locally)
-        self.ncnn_model = YOLO('yolo11n_ncnn_model')
+        # Load YOLO11n NCNN model from absolute path provided by user
+        self.ncnn_model = YOLO('/home/mitchell/Documents/PhD/circumnavigation_ws/yolo11n_ncnn_model')
         if self.show_debug_window:
             cv2.namedWindow('RealSense', cv2.WINDOW_AUTOSIZE)
 
