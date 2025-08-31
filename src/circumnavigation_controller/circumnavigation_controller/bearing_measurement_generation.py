@@ -60,7 +60,7 @@ class YoloImageNode(Node):
         if not os.path.exists(ncnn_export_path):
             self.model.export(format='ncnn', imgsz=320)
         # Load the exported NCNN model
-        self.ncnn_model = YOLO(ncnn_export_path)
+        self.ncnn_model = YOLO('yolo11n_ncnn_model')
         if self.show_debug_window:
             cv2.namedWindow('RealSense', cv2.WINDOW_AUTOSIZE)
 
