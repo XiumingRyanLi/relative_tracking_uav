@@ -19,51 +19,85 @@ os.environ['YOLO_VERBOSE'] = 'False'
 class YoloImageNode(Node):
     def __init__(self):
         super().__init__('yolo_image_node')
-        
-        # Image subscription
-        self.image_subscription = self.create_subscription(
-            Image,
-            '/image',
-            self.image_callback,
-            10)
-        
+        self.declare_parameter('enable_debug_publish', False)
+        self.enable_debug_publish = self.get_parameter('enable_debug_publish').get_parameter_value().bool_value
+
+        # Parameter to select image source: 'topic' or 'webcam'
+        self.declare_parameter('image_source', 'topic')
+        self.image_source = self.get_parameter('image_source').get_parameter_value().string_value
+
+        # If using webcam, declare webcam index parameter
+        self.declare_parameter('webcam_index', 0)
+        self.webcam_index = self.get_parameter('webcam_index').get_parameter_value().integer_value
+
+        self.declare_parameter('show_debug_window', True)
+        self.show_debug_window = self.get_parameter('show_debug_window').get_parameter_value().bool_value
         # MAVROS pose subscription for orientation with correct QoS
         mavros_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
             depth=10
         )
-        
         self.pose_subscription = self.create_subscription(
             PoseStamped,
             '/mavros/local_position/pose',
             self.pose_callback,
             mavros_qos)
-        
+
         # Bearing publisher
         self.bearing_publisher = self.create_publisher(Float64, '/bearing', 10)
-        
         # Error publisher for yaw controller (person position error from center)
         self.error_publisher = self.create_publisher(Float64, '/yaw_error', 10)
-        
+
         self.bridge = CvBridge()
-        # Initialize YOLO with all verbosity disabled
         import warnings
         warnings.filterwarnings("ignore")
         self.model = YOLO('yolov8n.pt')
         self.model.verbose = False
-        cv2.namedWindow('RealSense', cv2.WINDOW_AUTOSIZE)
-        
+        if self.show_debug_window:
+            cv2.namedWindow('RealSense', cv2.WINDOW_AUTOSIZE)
+
         # Current quadcopter yaw (heading) in radians
         self.current_yaw = 0.0
-        
-        # Camera parameters (you may need to adjust these for your camera)
+        # Camera parameters
         self.image_width = 640
         self.image_height = 480
         self.camera_fov_horizontal = 2.0  # Camera FOV in radians
-        
-        # Debug: Log when node starts
-        self.get_logger().info('YoloImageNode started, waiting for MAVROS pose data...')
+
+        # If using topic, subscribe to image topic
+        if self.image_source == 'topic':
+            self.image_subscription = self.create_subscription(
+                Image,
+                '/image',
+                self.image_callback,
+                10)
+            self.get_logger().info('YoloImageNode started in TOPIC mode, waiting for MAVROS pose and image topic...')
+        else:
+            # If using webcam, set up timer to read from webcam and publish to /image
+            self.webcam_publisher = self.create_publisher(Image, '/image', 10)
+            self.cap = cv2.VideoCapture(self.webcam_index)
+            if not self.cap.isOpened():
+                self.get_logger().error(f'Could not open webcam at index {self.webcam_index}')
+            else:
+                self.get_logger().info(f'YoloImageNode started in WEBCAM mode, publishing webcam frames to /image...')
+            self.timer = self.create_timer(1.0/30.0, self.webcam_timer_callback)  # 30 FPS
+
+    def webcam_timer_callback(self):
+        """Read image from webcam and publish to /image topic"""
+        if hasattr(self, 'cap') and self.cap.isOpened():
+            ret, frame = self.cap.read()
+            if ret:
+                # Resize to expected size
+                frame = cv2.resize(frame, (self.image_width, self.image_height))
+                msg = self.bridge.cv2_to_imgmsg(frame, encoding='bgr8')
+                if self.enable_debug_publish:
+                    self.webcam_publisher.publish(msg)
+                # Directly call image_callback for processing
+                self.image_callback(msg)
+            else:
+                self.get_logger().warn('Failed to read frame from webcam.')
+        else:
+            self.get_logger().warn('Webcam not opened.')
         
     def pose_callback(self, msg):
         """Get current quadcopter orientation from MAVROS"""
@@ -161,21 +195,24 @@ class YoloImageNode(Node):
                         person_detected = True
                         break
         
-        cv2.imshow('RealSense', annotated_frame)
-        cv2.waitKey(1)
+        if self.show_debug_window:
+            cv2.imshow('RealSense', annotated_frame)
+            cv2.waitKey(1)
             
 
 def main(args=None):
     rclpy.init(args=args)
     node = YoloImageNode()
-    
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         node.get_logger().info('Keyboard interrupt received, shutting down...')
     finally:
+        if hasattr(node, 'cap'):
+            node.cap.release()
         node.destroy_node()
-        cv2.destroyAllWindows()
+        if getattr(node, 'show_debug_window', True):
+            cv2.destroyAllWindows()
         rclpy.shutdown()
 
 if __name__ == '__main__':
