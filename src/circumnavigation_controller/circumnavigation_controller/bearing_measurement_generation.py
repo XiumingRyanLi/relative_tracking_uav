@@ -52,14 +52,7 @@ class YoloImageNode(Node):
         self.bridge = CvBridge()
         import warnings
         warnings.filterwarnings("ignore")
-        # Load YOLO11n PyTorch model
-        self.model = YOLO('yolo11n.pt')
-        self.model.verbose = False
-        # Export to NCNN format with lower resolution if not already exported
-        ncnn_export_path = 'yolo11n_ncnn_model'
-        if not os.path.exists(ncnn_export_path):
-            self.model.export(format='ncnn', imgsz=320)
-        # Load the exported NCNN model
+        # Load YOLO11n NCNN model directly (must be present locally)
         self.ncnn_model = YOLO('yolo11n_ncnn_model')
         if self.show_debug_window:
             cv2.namedWindow('RealSense', cv2.WINDOW_AUTOSIZE)
@@ -137,7 +130,6 @@ class YoloImageNode(Node):
 
     def image_callback(self, msg):
         """Process image and detect person, calculate bearing"""
-        print("image callback")
         frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         # Run YOLO inference with NCNN model
         results = self.ncnn_model(frame, verbose=False)
