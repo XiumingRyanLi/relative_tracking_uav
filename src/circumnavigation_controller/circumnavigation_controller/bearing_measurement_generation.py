@@ -6,7 +6,8 @@ os.environ["AUTOINSTALL"] = "0"
 os.environ["YOLOv5_AUTOINSTALL"] = "0"
 os.environ["OV_CPU_THREADS_NUM"] = "2"
 os.environ["OMP_NUM_THREADS"] = "2"
-from ultralytics.yolo import utils as yutils
+from ultralytics import YOLO  
+from ultralytics import utils as yutils
 yutils.ONLINE = False
 # -------------------------------------------------------------------------------
 
@@ -18,7 +19,7 @@ from std_msgs.msg import Float64
 from geometry_msgs.msg import PoseStamped
 from cv_bridge import CvBridge
 import cv2
-from ultralytics import YOLO
+
 import numpy as np
 import tf_transformations
 import logging
