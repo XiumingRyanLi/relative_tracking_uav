@@ -11,7 +11,7 @@ def generate_launch_description():
             parameters=[
                 {'image_source': 'topic'},
                 {'show_debug_window': True},
-                {'enable_debug_publish': False}
+                {'enable_debug_publish': True}
             ]
         ),
         Node(

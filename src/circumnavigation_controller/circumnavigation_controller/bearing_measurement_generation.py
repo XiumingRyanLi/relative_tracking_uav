@@ -30,6 +30,18 @@ logging.getLogger("ultralytics").setLevel(logging.ERROR)
 os.environ["YOLO_VERBOSE"] = "False"
 warnings.filterwarnings("ignore")
 
+# Get the workspace root directory
+def get_workspace_root():
+    """Find the workspace root by looking for colcon workspace structure"""
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    while current_dir != '/':
+        if os.path.exists(os.path.join(current_dir, 'src')) and \
+           os.path.exists(os.path.join(current_dir, 'build')) and \
+           os.path.exists(os.path.join(current_dir, 'install')):
+            return current_dir
+        current_dir = os.path.dirname(current_dir)
+    return None
+
 
 class YoloImageNode(Node):
     def __init__(self):
@@ -57,9 +69,13 @@ class YoloImageNode(Node):
         )
 
         # Path to exported OpenVINO model (folder OR .xml)
+        # Get workspace root and construct relative path
+        workspace_root = get_workspace_root()
+        default_model_path = os.path.join(workspace_root, "yolo11n_openvino_model") if workspace_root else "yolo11n_openvino_model"
+        
         self.declare_parameter(
             "model_path",
-            "/home/case/circumnavigation_ws/yolo11n_openvino_model",
+            default_model_path,
         )
         self.model_path = (
             self.get_parameter("model_path").get_parameter_value().string_value
