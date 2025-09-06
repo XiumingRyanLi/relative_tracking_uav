@@ -156,9 +156,7 @@ class YoloImageNode(Node):
                     frame, (self.imgsz, self.imgsz), interpolation=cv2.INTER_NEAREST
                 )
                 msg = self.bridge.cv2_to_imgmsg(frame, encoding="bgr8")
-                if self.enable_debug_publish:
-                    self.webcam_publisher.publish(msg)
-                # Process inline
+
                 self.image_callback(msg)
             else:
                 self.get_logger().warning("Failed to read frame from webcam.")
@@ -229,9 +227,9 @@ class YoloImageNode(Node):
 
                     bearing_degrees = np.degrees(bearing)
                     error_degrees = np.degrees(error_radians)
-                    self.get_logger().info(
-                        f"Person detected! Bearing: {bearing_degrees:.1f}\u00b0, Error: {error_degrees:.1f}\u00b0"
-                    )
+                    #self.get_logger().info(
+                    #    f"Person detected! Bearing: {bearing_degrees:.1f}\u00b0, Error: {error_degrees:.1f}\u00b0"
+                    #)
 
                     cv2.circle(annotated_frame, (int(cx), int(cy)), 5, (0, 255, 0), -1)
                     cv2.putText(
@@ -265,6 +263,10 @@ class YoloImageNode(Node):
         if self.show_debug_window:
             cv2.imshow("RealSense", annotated_frame)
             cv2.waitKey(1)
+
+        if self.enable_debug_publish:
+            msg = self.bridge.cv2_to_imgmsg(annotated_frame, encoding="bgr8")
+            self.webcam_publisher.publish(msg)
 
 
 def main(args=None):

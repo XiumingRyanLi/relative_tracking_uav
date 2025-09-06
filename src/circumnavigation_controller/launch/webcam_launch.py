@@ -11,7 +11,7 @@ def generate_launch_description():
             parameters=[
                 {'image_source': 'webcam', 'webcam_index': 0},
                 {'show_debug_window': False},
-                {'enable_debug_publish': False}
+                {'enable_debug_publish': True}
             ]
         ),
         Node(
@@ -20,4 +20,6 @@ def generate_launch_description():
             name='controller_node',
             output='screen'
         )
+
+        
     ])
