@@ -4,7 +4,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from rclpy.executors import MultiThreadedExecutor
 
-from std_msgs.msg import Float64
+from std_msgs.msg import Float64, Bool
 from geometry_msgs.msg import PoseStamped, TwistStamped
 from mavros_msgs.msg import State
 from mavros_msgs.srv import CommandBool, CommandTOL, SetMode
@@ -38,6 +38,7 @@ class CircumnavigationController(Node):
         self.pose_sub = self.create_subscription(PoseStamped, '/mavros/local_position/pose', self._on_pose, pose_qos)
 
         self.err_sub = self.create_subscription( Float64, '/yaw_error', self._on_person_error, 10)
+        self.tracking_enable_sub = self.create_subscription(Bool, '/tracking_enable', self._on_tracking_enable, 10)
 
         # ---- Publisher: always stream setpoints (>=2 Hz for GUIDED pre-arm) ----
         self.vel_pub = self.create_publisher( TwistStamped, '/mavros/setpoint_velocity/cmd_vel', 10)
@@ -53,9 +54,9 @@ class CircumnavigationController(Node):
         self.pose = PoseStamped()
         self.person_err = 0.0
 
-        self.target_altitude = 5.0
-        self.yaw_kp = 2.0
-        self.max_yaw_rate = 2.0
+        self.target_altitude = 4.0
+        self.yaw_kp = 0.4
+        self.max_yaw_rate = 1.0
         self._last_yaw_rate = 0.0
 
         # Idempotent step guards
@@ -69,6 +70,7 @@ class CircumnavigationController(Node):
         self._tko_reached = False
 
         self._tracking_enabled = False
+        self._tracking_manual_override = False  # Manual enable/disable via topic
         self._armed_time = None  # when FCU confirmed armed
 
         # Small non-blocking orchestration tick
@@ -104,6 +106,15 @@ class CircumnavigationController(Node):
 
     def _on_person_error(self, msg: Float64):
         self.person_err = float(msg.data)
+
+    def _on_tracking_enable(self, msg: Bool):
+        """Handle manual tracking enable/disable commands"""
+        self._tracking_manual_override = msg.data
+        if msg.data:
+            self._enable_tracking_manual()
+        else:
+            self._disable_tracking_manual()
+        self.get_logger().info(f'Manual tracking override: {"ENABLED" if msg.data else "DISABLED"}')
 
     # ------------------------------------------------------------------
     # Orchestration (non-blocking)
@@ -222,7 +233,19 @@ class CircumnavigationController(Node):
     def _enable_tracking(self):
         if not self._tracking_enabled:
             self._tracking_enabled = True
-            self.get_logger().info('Tracking enabled.')
+            self.get_logger().info('Tracking enabled (automatic - takeoff complete).')
+
+    def _enable_tracking_manual(self):
+        """Enable tracking manually via topic command"""
+        if not self._tracking_enabled:
+            self._tracking_enabled = True
+            self.get_logger().info('Tracking enabled (manual override).')
+
+    def _disable_tracking_manual(self):
+        """Disable tracking manually via topic command"""
+        if self._tracking_enabled:
+            self._tracking_enabled = False
+            self.get_logger().info('Tracking disabled (manual override).')
 
     def _publish_setpoint(self):
         """
@@ -230,16 +253,22 @@ class CircumnavigationController(Node):
         - Before armed/takeoff: stream zeros (satisfies GUIDED + pre-arm conditions).
         - After tracking enabled: yaw-rate = -kp * error (saturated).
         """
+
+        # Always create and publish a message (even if zeros)
+        msg = TwistStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = 'base_link'
+        
+        print(f"is tracking enabled? {self._tracking_enabled}")
+        print(f"armed_confirmed: {self._armed_confirmed}, tko_reached: {self._tko_reached}")
+        print(f"current altitude: {self.pose.pose.position.z:.2f}m, target: {self.target_altitude}m")
+        
         yaw_rate = 0.0
         if self._tracking_enabled:
             yaw_rate = -self.yaw_kp * self.person_err
             yaw_rate = max(min(yaw_rate, self.max_yaw_rate), -self.max_yaw_rate)
-
             print(f'Person error: {self.person_err:.3f} rad, Yaw rate: {yaw_rate:.3f} rad/s')
 
-            msg = TwistStamped()
-            msg.header.stamp = self.get_clock().now().to_msg()
-            msg.header.frame_id = 'base_link'
             msg.twist.angular.z = float(yaw_rate)
             self.vel_pub.publish(msg)
 
