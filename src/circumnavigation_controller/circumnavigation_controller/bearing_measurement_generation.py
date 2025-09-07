@@ -15,7 +15,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import Image
-from std_msgs.msg import Float64
+from std_msgs.msg import Float64, Float64
 from geometry_msgs.msg import PoseStamped
 from cv_bridge import CvBridge
 import cv2
@@ -86,14 +86,14 @@ class YoloImageNode(Node):
         self.imgsz = int(self.get_parameter("imgsz").get_parameter_value().integer_value)
         # ----------------------------------------------------------
 
-        # MAVROS pose subscription (BEST_EFFORT)
+        # MAVROS compass heading subscription (BEST_EFFORT)
         mavros_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
             depth=10,
         )
-        self.pose_subscription = self.create_subscription(
-            PoseStamped, "/mavros/local_position/pose", self.pose_callback, mavros_qos
+        self.compass_subscription = self.create_subscription(
+            Float64, "/mavros/global_position/compass_hdg", self.compass_callback, mavros_qos
         )
 
         # Publishers
@@ -116,18 +116,19 @@ class YoloImageNode(Node):
         self.current_yaw = 0.0
         self.image_width = self.imgsz
         self.image_height = self.imgsz
-        self.camera_fov_horizontal = 2.0  # radians (≈114.6°) – tune for your camera
+        self.camera_fov_horizontal = 0.8  # radians (≈114.6°) – tune for your camera
+
+        self.webcam_publisher = self.create_publisher(Image, "/image", 10)
 
         # Image source
         if self.image_source == "topic":
             self.image_subscription = self.create_subscription(
-                Image, "/image", self.image_callback, 10
+                Image, "/camera/image_raw", self.image_callback, 10
             )
             self.get_logger().info(
-                "YoloImageNode started in TOPIC mode, waiting for MAVROS pose and image topic..."
+                "YoloImageNode started in TOPIC mode, waiting for MAVROS compass heading and image topic..."
             )
         else:
-            self.webcam_publisher = self.create_publisher(Image, "/image", 10)
             # Use V4L2 for better throughput; request imgsz x imgsz @ 30fps
             self.cap = cv2.VideoCapture(self.webcam_index, cv2.CAP_V4L2)
             self.cap.set(cv2.CAP_PROP_FPS, 30)
@@ -163,12 +164,10 @@ class YoloImageNode(Node):
         else:
             self.get_logger().warning("Webcam not opened.")
 
-    def pose_callback(self, msg):
-        """Get current quadcopter orientation from MAVROS"""
-        q = msg.pose.orientation
-        _, _, self.current_yaw = tf_transformations.euler_from_quaternion(
-            [q.x, q.y, q.z, q.w]
-        )
+    def compass_callback(self, msg):
+        """Get current quadcopter orientation from MAVROS compass heading"""
+        # Convert degrees to radians
+        self.current_yaw = np.radians(msg.data)
 
     def calculate_person_error(self, person_center_x):
         """Error in radians between person and frame center"""
@@ -220,7 +219,7 @@ class YoloImageNode(Node):
                     cy = (y1 + y2) / 2
 
                     error_radians = self.calculate_person_error(cx)
-                    bearing = self.current_yaw - error_radians
+                    bearing = self.current_yaw + error_radians
 
                     self.bearing_publisher.publish(Float64(data=float(bearing)))
                     self.error_publisher.publish(Float64(data=float(error_radians)))

@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 import rclpy
+import math
+import csv
+import os
+import numpy as np
+from datetime import datetime
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from rclpy.executors import MultiThreadedExecutor
@@ -10,7 +15,7 @@ from mavros_msgs.msg import State
 from mavros_msgs.srv import CommandBool, CommandTOL, SetMode
 
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from rclpy.qos import qos_profile_sensor_data  # handy preset
+from rclpy.qos import qos_profile_sensor_data
 
 
 
@@ -18,48 +23,54 @@ class CircumnavigationController(Node):
     def __init__(self):
         super().__init__('circumnavigation_controller')
 
-
-        # For /mavros/state (usually fine as RELIABLE)
         state_qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
             history=HistoryPolicy.KEEP_LAST,
             depth=10
         )
 
-        # For /mavros/local_position/pose (match SensorData: BEST_EFFORT, VOLATILE)
-        pose_qos = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            durability=DurabilityPolicy.VOLATILE,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=10
-        )
+        pose_qos = QoSProfile( reliability=ReliabilityPolicy.BEST_EFFORT, durability=DurabilityPolicy.VOLATILE, history=HistoryPolicy.KEEP_LAST, depth=10)
 
         self.state_sub = self.create_subscription( State, '/mavros/state', self._on_state, state_qos)
         self.pose_sub = self.create_subscription(PoseStamped, '/mavros/local_position/pose', self._on_pose, pose_qos)
 
+        self.compass_sub = self.create_subscription(Float64, '/mavros/global_position/compass_hdg', self._on_compass, 10)
+
         self.err_sub = self.create_subscription( Float64, '/yaw_error', self._on_person_error, 10)
+        self.bearing_sub = self.create_subscription(Float64, '/bearing', self._on_bearing, 10)
         self.tracking_enable_sub = self.create_subscription(Bool, '/tracking_enable', self._on_tracking_enable, 10)
 
-        # ---- Publisher: always stream setpoints (>=2 Hz for GUIDED pre-arm) ----
         self.vel_pub = self.create_publisher( TwistStamped, '/mavros/setpoint_velocity/cmd_vel', 10)
-        self.setpoint_timer = self.create_timer(0.05, self._publish_setpoint)  # 20 Hz
+        self.setpoint_timer = self.create_timer(0.25, self._publish_setpoint)
 
-        # ---- Services ----
         self.set_mode_client = self.create_client(SetMode, '/mavros/set_mode')
         self.arming_client = self.create_client(CommandBool, '/mavros/cmd/arming')
         self.takeoff_client = self.create_client(CommandTOL, '/mavros/cmd/takeoff')
 
-        # ---- Internal state ----
         self.state = State()
         self.pose = PoseStamped()
         self.person_err = 0.0
+        self.bearing = 0.0
+        self.compass_hdg = 0.0
 
-        self.target_altitude = 4.0
-        self.yaw_kp = 0.4
-        self.max_yaw_rate = 1.0
+        self.target_altitude = 3.0
+        self.tangential_speed = 0.5
+        self.parallel_speed = 0.25
+        self.yaw_kp = 1.0
+        self.max_yaw_rate = 1.5
         self._last_yaw_rate = 0.0
 
-        # Idempotent step guards
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.csv_filename = f"circumnavigation_data_{timestamp}.csv"
+        self.csv_file = open(self.csv_filename, 'w', newline='')
+        self.csv_writer = csv.writer(self.csv_file)
+        self.csv_writer.writerow([
+            'timestamp', 'x', 'y', 'z', 'compass_hdg', 'bearing', 'yaw_error', 
+            'vel_x', 'vel_y', 'vel_z', 'yaw_rate', 
+            'estimated_state_x', 'estimated_state_y','desired_radius','distance_error'
+        ])
+        self.get_logger().info(f'CSV logging initialized: {self.csv_filename}')
+
         self._guided_requested = False
         self._guided_confirmed = False
 
@@ -70,42 +81,70 @@ class CircumnavigationController(Node):
         self._tko_reached = False
 
         self._tracking_enabled = False
-        self._tracking_manual_override = False  # Manual enable/disable via topic
-        self._armed_time = None  # when FCU confirmed armed
+        self._tracking_manual_override = False
+        self._armed_time = None
+        self._takeoff_complete_time = None
+        self._rtl_initiated = False
 
-        # Small non-blocking orchestration tick
-        self.orchestrator = self.create_timer(0.2, self._orchestrate)  # 5 Hz
+        # Safety boundaries (30x30m square centered at origin)
+        self.boundary_limit = 15.0  # 15m from center in any direction
+        
+        self.orchestrator = self.create_timer(0.2, self._orchestrate)
+        self.safety_timer = self.create_timer(1.0, self._check_safety_conditions)
+
+
+        self.estimator_gain = 1.0
+        self.estimated_state = np.array([0.0, 0.0])
+        self.desired_radius = 4.0
+        self.estimated_error = 0.0
 
         self.get_logger().info('Circumnavigation Controller (callbacks) started')
 
-    # ------------------------------------------------------------------
-    # Topic callbacks
-    # ------------------------------------------------------------------
     def _on_state(self, msg: State):
         self.state = msg
 
-        # Confirm GUIDED
         if self.state.mode == 'GUIDED' and not self._guided_confirmed:
             self._guided_confirmed = True
             self.get_logger().info('GUIDED confirmed by FCU.')
 
-        # Confirm ARMED
         if self.state.armed and not self._armed_confirmed:
             self._armed_confirmed = True
-            self._armed_time = self.get_clock().now().nanoseconds / 1e9  # store current time
-            self.get_logger().info('Armed confirmed by FCU.')
+            self._armed_time = self.get_clock().now().nanoseconds / 1e9
+            
+            # Initialize estimated state based on compass heading (drone facing target)
+            # Convert compass heading to radians (compass: 0=North, clockwise positive)
+            # In NED frame: North=+Y, East=+X
+            compass_rad = math.radians(self.compass_hdg)
+            
+            # Calculate target position 6m behind drone (opposite to facing direction)
+            # If drone faces target, target is 6m in the direction drone is facing
+            target_x = self.pose.pose.position.x + 6.0 * math.sin(compass_rad)
+            target_y = self.pose.pose.position.y + 6.0 * math.cos(compass_rad)
+            
+            self.estimated_state = np.array([target_x, target_y])
+            
+            self.get_logger().info(f'Armed confirmed by FCU. Compass: {self.compass_hdg:.1f}°')
+            self.get_logger().info(f'Estimated target at: ({target_x:.2f}, {target_y:.2f})')
 
 
     def _on_pose(self, msg: PoseStamped):
         self.pose = msg
         alt = msg.pose.position.z
+        
         if self._armed_confirmed and not self._tko_reached and alt > (self.target_altitude - 0.5):
             self._tko_reached = True
-            self.get_logger().info(f'Takeoff complete at {alt:.2f} m')
+            self._takeoff_complete_time = self.get_clock().now().nanoseconds / 1e9
+            self.get_logger().info(f'Takeoff complete at {alt:.2f} m - Starting 60s safety timer')
             self._enable_tracking()
 
     def _on_person_error(self, msg: Float64):
         self.person_err = float(msg.data)
+
+    def _on_bearing(self, msg: Float64):
+        self.bearing = float(msg.data)
+
+    def _on_compass(self, msg: Float64):
+        self.compass_hdg = float(msg.data)
 
     def _on_tracking_enable(self, msg: Bool):
         """Handle manual tracking enable/disable commands"""
@@ -116,26 +155,20 @@ class CircumnavigationController(Node):
             self._disable_tracking_manual()
         self.get_logger().info(f'Manual tracking override: {"ENABLED" if msg.data else "DISABLED"}')
 
-    # ------------------------------------------------------------------
-    # Orchestration (non-blocking)
-    # ------------------------------------------------------------------
     def _orchestrate(self):
         if not self.state.connected:
             return
 
-        # 1) Ensure GUIDED
         if not self._guided_confirmed:
             if not self._guided_requested:
                 self._request_guided()
             return
 
-        # 2) Ensure ARMED
         if not self._armed_confirmed:
             if not self._arm_requested:
                 self._request_arm()
             return
 
-        # 3) Wait 5 seconds after arming before takeoff
         if self._armed_confirmed and self._armed_time is not None and not self._tko_requested:
             elapsed = self.get_clock().now().nanoseconds / 1e9 - self._armed_time
             if elapsed < 5.0:
@@ -145,13 +178,9 @@ class CircumnavigationController(Node):
                 return
             else:
                 self._request_takeoff()
-                self._armed_wait_logged = False  # reset for next cycle
+                self._armed_wait_logged = False
                 return
 
-
-    # ------------------------------------------------------------------
-    # Service requests (async) + done-callbacks
-    # ------------------------------------------------------------------
     def _request_guided(self):
         if not self.set_mode_client.wait_for_service(timeout_sec=0.5):
             self.get_logger().warn('SetMode service not ready yet.')
@@ -168,14 +197,14 @@ class CircumnavigationController(Node):
             res = fut.result()
         except Exception as e:
             self.get_logger().error(f'SetMode exception: {e}')
-            self._guided_requested = False  # allow retry
+            self._guided_requested = False
             return
 
         if getattr(res, 'mode_sent', False):
             self.get_logger().info('GUIDED command accepted (awaiting FCU report).')
         else:
             self.get_logger().error('GUIDED command rejected by FCU.')
-            self._guided_requested = False  # allow retry on next orchestrate tick
+            self._guided_requested = False
 
     def _request_arm(self):
         if not self.arming_client.wait_for_service(timeout_sec=0.5):
@@ -193,14 +222,14 @@ class CircumnavigationController(Node):
             res = fut.result()
         except Exception as e:
             self.get_logger().error(f'Arming exception: {e}')
-            self._arm_requested = False  # allow retry
+            self._arm_requested = False
             return
 
         if getattr(res, 'success', False):
             self.get_logger().info('Arm accepted (awaiting FCU armed=true).')
         else:
             self.get_logger().error(f'Arm rejected by FCU (result={getattr(res, "result", None)}).')
-            self._arm_requested = False  # allow retry
+            self._arm_requested = False
 
     def _request_takeoff(self):
         if not self.takeoff_client.wait_for_service(timeout_sec=0.5):
@@ -218,18 +247,15 @@ class CircumnavigationController(Node):
             res = fut.result()
         except Exception as e:
             self.get_logger().error(f'Takeoff exception: {e}')
-            self._tko_requested = False  # allow retry
+            self._tko_requested = False
             return
 
         if getattr(res, 'success', False):
             self.get_logger().info('Takeoff command accepted (monitoring altitude).')
         else:
             self.get_logger().error('Takeoff rejected by FCU.')
-            self._tko_requested = False  # allow retry
+            self._tko_requested = False
 
-    # ------------------------------------------------------------------
-    # Control / setpoint streaming
-    # ------------------------------------------------------------------
     def _enable_tracking(self):
         if not self._tracking_enabled:
             self._tracking_enabled = True
@@ -247,38 +273,166 @@ class CircumnavigationController(Node):
             self._tracking_enabled = False
             self.get_logger().info('Tracking disabled (manual override).')
 
-    def _publish_setpoint(self):
-        """
-        Always stream velocity setpoints.
-        - Before armed/takeoff: stream zeros (satisfies GUIDED + pre-arm conditions).
-        - After tracking enabled: yaw-rate = -kp * error (saturated).
-        """
+    def _check_safety_conditions(self):
+        """Check safety conditions and initiate RTL if necessary"""
+        if self._rtl_initiated or not self._tko_reached:
+            return
+            
+        current_time = self.get_clock().now().nanoseconds / 1e9
+        
+        # Check 120-second timer after takeoff
+        if self._takeoff_complete_time is not None:
+            elapsed_since_takeoff = current_time - self._takeoff_complete_time
+            if elapsed_since_takeoff >= 120.0:
+                self.get_logger().warn('120 seconds elapsed since takeoff - Initiating RTL')
+                self._initiate_rtl('120-second timer expired')
+                return
+        
+        # Check boundary conditions (30x30m square)
+        x = self.pose.pose.position.x
+        y = self.pose.pose.position.y
+        
+        if abs(x) > self.boundary_limit or abs(y) > self.boundary_limit:
+            self.get_logger().warn(f'Boundary violation: position ({x:.1f}, {y:.1f}) - Initiating RTL')
+            self._initiate_rtl(f'boundary violation at ({x:.1f}, {y:.1f})')
+            return
 
-        # Always create and publish a message (even if zeros)
+    def _initiate_rtl(self, reason):
+        """Initiate return to land mode and disable tracking"""
+        if self._rtl_initiated:
+            return
+            
+        self._rtl_initiated = True
+        self._tracking_enabled = False
+        
+        self.get_logger().warn(f'SAFETY: Initiating RTL due to {reason}')
+        
+        if not self.set_mode_client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().error('SetMode service not available for RTL!')
+            return
+            
+        req = SetMode.Request()
+        req.custom_mode = 'RTL'
+        fut = self.set_mode_client.call_async(req)
+        fut.add_done_callback(lambda f: self._on_rtl_done(f, reason))
+
+    def _on_rtl_done(self, fut, reason):
+        """Handle RTL mode change response"""
+        try:
+            res = fut.result()
+        except Exception as e:
+            self.get_logger().error(f'RTL exception: {e}')
+            return
+
+        if getattr(res, 'mode_sent', False):
+            self.get_logger().info(f'RTL command accepted (reason: {reason})')
+        else:
+            self.get_logger().error(f'RTL command rejected by FCU (reason: {reason})')
+
+    def _publish_setpoint(self):
         msg = TwistStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = 'base_link'
         
-        print(f"is tracking enabled? {self._tracking_enabled}")
-        print(f"armed_confirmed: {self._armed_confirmed}, tko_reached: {self._tko_reached}")
-        print(f"current altitude: {self.pose.pose.position.z:.2f}m, target: {self.target_altitude}m")
-        
         yaw_rate = 0.0
+        
+        # Don't send velocity commands if RTL has been initiated
+        if self._rtl_initiated:
+            # Send zero velocity to stop any movement
+            self.vel_pub.publish(msg)
+            current_time = self.get_clock().now().nanoseconds / 1e9
+            self.csv_writer.writerow([
+                current_time,
+                self.pose.pose.position.x,
+                self.pose.pose.position.y, 
+                self.pose.pose.position.z,
+                self.compass_hdg,
+                self.bearing,
+                self.person_err,
+                0.0,  # Zero velocities during RTL
+                0.0,
+                0.0,
+                0.0,
+                self.estimated_state[0],
+                self.estimated_state[1],
+                self.desired_radius,
+                self.estimated_error,
+            ])
+            self.csv_file.flush()
+            return
+            
         if self._tracking_enabled:
+
             yaw_rate = -self.yaw_kp * self.person_err
             yaw_rate = max(min(yaw_rate, self.max_yaw_rate), -self.max_yaw_rate)
-            print(f'Person error: {self.person_err:.3f} rad, Yaw rate: {yaw_rate:.3f} rad/s')
+            tangential_angle = self.bearing + math.pi/2
+
+
+            bearing_vector = np.array([math.sin(self.bearing), math.cos(self.bearing)])
+
+
+            Projection_matrix = np.outer(bearing_vector, bearing_vector)
+            I = np.eye(2)
+            Q = I - Projection_matrix
+            position =  [self.pose.pose.position.x, self.pose.pose.position.y]
+            estimator_state_update = self.estimator_gain * Q @ (position - self.estimated_state)
+            self.estimated_state += estimator_state_update / 20
+
+
+            estimated_distance_to_target = np.linalg.norm(position - self.estimated_state[:2])
+            self.estimated_error = estimated_distance_to_target - self.desired_radius
+            
+            msg.twist.linear.x = float(self.tangential_speed * math.sin(tangential_angle) + self.parallel_speed * self.estimated_error * math.sin(self.bearing))
+            msg.twist.linear.y = float(self.tangential_speed * math.cos(tangential_angle) + self.parallel_speed * self.estimated_error * math.cos(self.bearing))
 
             msg.twist.angular.z = float(yaw_rate)
+            
+            self.get_logger().info(f'NEW ITERATION ')
+            self.get_logger().info(f'Bearing {self.bearing:.1f} Tangential angle {tangential_angle:.1f}...')
+            est_state = [self.estimated_state[0], self.estimated_state[1]]
+            self.get_logger().info(f'Position {position} est pos {est_state}')
+            self.get_logger().info(f'Est Distance {estimated_distance_to_target:.1f} Desired {self.desired_radius:.1f} Distance Error {self.estimated_error:.1f}')
+            self.get_logger().info(f'Towards Target speed {(self.parallel_speed * self.estimated_error):.1f}')
+            
+
+
+
             self.vel_pub.publish(msg)
 
 
+        current_time = self.get_clock().now().nanoseconds / 1e9
+        self.csv_writer.writerow([
+            current_time,
+            self.pose.pose.position.x,
+            self.pose.pose.position.y, 
+            self.pose.pose.position.z,
+            self.compass_hdg,
+            self.bearing,
+            self.person_err,
+            msg.twist.linear.x,
+            msg.twist.linear.y,
+            msg.twist.linear.z,
+            msg.twist.angular.z,
+            self.estimated_state[0],
+            self.estimated_state[1],
+            self.desired_radius,
+            self.estimated_error,
+
+        ])
+        self.csv_file.flush()
+
+
+    def destroy_node(self):
+        """Clean up CSV file when node is destroyed"""
+        if hasattr(self, 'csv_file'):
+            self.csv_file.close()
+            self.get_logger().info(f'CSV file closed: {self.csv_filename}')
+        super().destroy_node()
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = CircumnavigationController()
-    # Multi-threaded executor keeps service callbacks responsive.
     executor = MultiThreadedExecutor()
     executor.add_node(node)
     try:
