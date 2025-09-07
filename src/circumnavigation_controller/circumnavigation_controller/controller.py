@@ -12,7 +12,7 @@ from rclpy.executors import MultiThreadedExecutor
 from std_msgs.msg import Float64, Bool
 from geometry_msgs.msg import PoseStamped, TwistStamped
 from mavros_msgs.msg import State
-from mavros_msgs.srv import CommandBool, CommandTOL, SetMode
+from mavros_msgs.srv import CommandBool, CommandTOL, SetMode, MessageInterval
 
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from rclpy.qos import qos_profile_sensor_data
@@ -34,18 +34,19 @@ class CircumnavigationController(Node):
         self.state_sub = self.create_subscription( State, '/mavros/state', self._on_state, state_qos)
         self.pose_sub = self.create_subscription(PoseStamped, '/mavros/local_position/pose', self._on_pose, pose_qos)
 
-        self.compass_sub = self.create_subscription(Float64, '/mavros/global_position/compass_hdg', self._on_compass, 10)
+        self.compass_sub = self.create_subscription(Float64, '/mavros/global_position/compass_hdg', self._on_compass, pose_qos)
 
         self.err_sub = self.create_subscription( Float64, '/yaw_error', self._on_person_error, 10)
         self.bearing_sub = self.create_subscription(Float64, '/bearing', self._on_bearing, 10)
         self.tracking_enable_sub = self.create_subscription(Bool, '/tracking_enable', self._on_tracking_enable, 10)
 
         self.vel_pub = self.create_publisher( TwistStamped, '/mavros/setpoint_velocity/cmd_vel', 10)
-        self.setpoint_timer = self.create_timer(0.25, self._publish_setpoint)
+        self.setpoint_timer = self.create_timer(0.15, self._publish_setpoint)
 
         self.set_mode_client = self.create_client(SetMode, '/mavros/set_mode')
         self.arming_client = self.create_client(CommandBool, '/mavros/cmd/arming')
         self.takeoff_client = self.create_client(CommandTOL, '/mavros/cmd/takeoff')
+        self.message_interval_client = self.create_client(MessageInterval, '/mavros/set_message_interval')
 
         self.state = State()
         self.pose = PoseStamped()
@@ -53,7 +54,7 @@ class CircumnavigationController(Node):
         self.bearing = 0.0
         self.compass_hdg = 0.0
 
-        self.target_altitude = 3.0
+        self.target_altitude = 4.0
         self.tangential_speed = 0.5
         self.parallel_speed = 0.25
         self.yaw_kp = 1.0
@@ -98,7 +99,43 @@ class CircumnavigationController(Node):
         self.desired_radius = 4.0
         self.estimated_error = 0.0
 
+        # Set MAVROS message intervals
+        self._set_message_intervals()
+
         self.get_logger().info('Circumnavigation Controller (callbacks) started')
+
+    def _set_message_intervals(self):
+        """Set MAVROS message intervals for global position and compass to 30Hz"""
+        self._set_single_message_interval(32, 30.0, "Global Position") 
+        self._set_single_message_interval(74, 30.0, "Compass Heading")
+
+    def _set_single_message_interval(self, message_id, rate, description):
+        """Set a single message interval"""
+        if not self.message_interval_client.wait_for_service(timeout_sec=5.0):
+            self.get_logger().warn(f'MessageInterval service not ready for {description}')
+            return
+            
+        req = MessageInterval.Request()
+        req.message_id = message_id
+        req.message_rate = rate
+        
+        fut = self.message_interval_client.call_async(req)
+        fut.add_done_callback(lambda f, desc=description, mid=message_id, r=rate: self._on_message_interval_done(f, desc, mid, r))
+        
+        self.get_logger().info(f'Setting {description} (ID: {message_id}) to {rate}Hz...')
+
+    def _on_message_interval_done(self, fut, description, message_id, rate):
+        """Handle message interval service response"""
+        try:
+            res = fut.result()
+        except Exception as e:
+            self.get_logger().error(f'{description} interval setting exception: {e}')
+            return
+
+        if getattr(res, 'success', False):
+            self.get_logger().info(f'{description} interval set to {rate}Hz successfully')
+        else:
+            self.get_logger().warn(f'{description} interval setting failed (ID: {message_id}, Rate: {rate}Hz)')
 
     def _on_state(self, msg: State):
         self.state = msg
