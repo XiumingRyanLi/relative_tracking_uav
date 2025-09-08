@@ -129,19 +129,44 @@ class YoloImageNode(Node):
                 "YoloImageNode started in TOPIC mode, waiting for MAVROS compass heading and image topic..."
             )
         else:
-            # Use V4L2 for better throughput; request imgsz x imgsz @ 30fps
-            self.cap = cv2.VideoCapture(self.webcam_index, cv2.CAP_V4L2)
-            self.cap.set(cv2.CAP_PROP_FPS, 30)
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.imgsz)
-            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.imgsz)
+            # Try different backends for camera access
+            self.cap = None
+            backends_to_try = [cv2.CAP_V4L2, cv2.CAP_ANY]
+            
+            for backend in backends_to_try:
+                try:
+                    self.cap = cv2.VideoCapture(self.webcam_index, backend)
+                    if self.cap.isOpened():
+                        self.get_logger().info(f"Successfully opened camera {self.webcam_index} with backend {backend}")
+                        break
+                    else:
+                        self.cap.release()
+                        self.cap = None
+                except Exception as e:
+                    self.get_logger().warning(f"Failed to open camera with backend {backend}: {e}")
+                    if self.cap:
+                        self.cap.release()
+                        self.cap = None
 
-            if not self.cap.isOpened():
+            if self.cap is None or not self.cap.isOpened():
                 self.get_logger().error(
-                    f"Could not open webcam at index {self.webcam_index}"
+                    f"Could not open webcam at index {self.webcam_index}. "
+                    f"Make sure your user is in the 'video' group: sudo usermod -a -G video $USER"
                 )
             else:
+                # Set camera properties
+                self.cap.set(cv2.CAP_PROP_FPS, 30)
+                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.imgsz)
+                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.imgsz)
+                
+                # Log actual camera properties
+                actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
+                actual_width = self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+                actual_height = self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+                
                 self.get_logger().info(
-                    "YoloImageNode started in WEBCAM mode, publishing webcam frames to /image..."
+                    f"YoloImageNode started in WEBCAM mode. Camera properties: "
+                    f"FPS={actual_fps}, Width={actual_width}, Height={actual_height}"
                 )
             self.timer = self.create_timer(
                 1.0 / 30.0, self.webcam_timer_callback
@@ -149,7 +174,7 @@ class YoloImageNode(Node):
 
     def webcam_timer_callback(self):
         """Read image from webcam and publish to /image topic"""
-        if hasattr(self, "cap") and self.cap.isOpened():
+        if hasattr(self, "cap") and self.cap is not None and self.cap.isOpened():
             ret, frame = self.cap.read()
             if ret:
                 # Resize to IR input size (square) – must match export
@@ -276,7 +301,7 @@ def main(args=None):
     except KeyboardInterrupt:
         node.get_logger().info("Keyboard interrupt received, shutting down...")
     finally:
-        if hasattr(node, "cap"):
+        if hasattr(node, "cap") and node.cap is not None:
             node.cap.release()
         node.destroy_node()
         if getattr(node, "show_debug_window", True):

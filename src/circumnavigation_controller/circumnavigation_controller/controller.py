@@ -55,10 +55,10 @@ class CircumnavigationController(Node):
         self.compass_hdg = 0.0
 
         self.target_altitude = 4.0
-        self.tangential_speed = 0.5
-        self.parallel_speed = 0.25
-        self.yaw_kp = 1.0
-        self.max_yaw_rate = 1.5
+        self.tangential_speed = 0.8
+        self.parallel_speed = 0.4
+        self.yaw_kp = 1.5
+        self.max_yaw_rate = 2.0
         self._last_yaw_rate = 0.0
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -88,15 +88,15 @@ class CircumnavigationController(Node):
         self._rtl_initiated = False
 
         # Safety boundaries (30x30m square centered at origin)
-        self.boundary_limit = 15.0  # 15m from center in any direction
+        self.boundary_limit = 25.0  # 15m from center in any direction
         
         self.orchestrator = self.create_timer(0.2, self._orchestrate)
         self.safety_timer = self.create_timer(1.0, self._check_safety_conditions)
 
 
-        self.estimator_gain = 1.0
+        self.estimator_gain = 0.1
         self.estimated_state = np.array([0.0, 0.0])
-        self.desired_radius = 4.0
+        self.desired_radius = 5.0
         self.estimated_error = 0.0
 
         # Set MAVROS message intervals
