@@ -24,6 +24,10 @@ import numpy as np
 import tf_transformations
 import logging
 import warnings
+from datetime import datetime
+import glob
+import signal
+import sys
 
 # Silence YOLO logging
 logging.getLogger("ultralytics").setLevel(logging.ERROR)
@@ -68,6 +72,31 @@ class YoloImageNode(Node):
             self.get_parameter("show_debug_window").get_parameter_value().bool_value
         )
 
+        # Frame saving and video creation parameters
+        self.declare_parameter("save_frames", False)
+        self.save_frames = (
+            self.get_parameter("save_frames").get_parameter_value().bool_value
+        )
+
+        self.declare_parameter("create_video", True)
+        self.create_video = (
+            self.get_parameter("create_video").get_parameter_value().bool_value
+        )
+
+        self.declare_parameter("video_fps", 30.0)
+        self.video_fps = float(
+            self.get_parameter("video_fps").get_parameter_value().double_value
+        )
+
+        self.declare_parameter("output_dir", "")
+        self.output_dir = (
+            self.get_parameter("output_dir").get_parameter_value().string_value
+        )
+
+        # Log parameter values for debugging
+        self.get_logger().info(f"Video recording parameters: save_frames={self.save_frames}, create_video={self.create_video}, video_fps={self.video_fps}")
+        self.get_logger().info(f"Output directory: '{self.output_dir}' (empty means workspace root)")
+
         # Path to exported OpenVINO model (folder OR .xml)
         # Get workspace root and construct relative path
         workspace_root = get_workspace_root()
@@ -108,6 +137,34 @@ class YoloImageNode(Node):
         except Exception as e:
             self.get_logger().error(f"Failed to load model at {self.model_path}: {e}")
             raise
+
+        # Initialize frame saving
+        self.frame_count = 0
+        self.saved_frames = []
+        
+        if self.save_frames or self.create_video:
+            # Create output directory with timestamp
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            if self.output_dir:
+                self.frames_dir = os.path.join(self.output_dir, f"frames_{timestamp}")
+            else:
+                # Use workspace root or current directory
+                workspace_root = get_workspace_root()
+                base_dir = workspace_root if workspace_root else os.getcwd()
+                self.frames_dir = os.path.join(base_dir, f"frames_{timestamp}")
+            
+            os.makedirs(self.frames_dir, exist_ok=True)
+            self.get_logger().info(f"Frame saving ENABLED - Directory: {self.frames_dir}")
+            self.get_logger().info(f"Video creation settings - save_frames: {self.save_frames}, create_video: {self.create_video}, fps: {self.video_fps}")
+            
+            # Video output filename
+            self.video_filename = os.path.join(
+                os.path.dirname(self.frames_dir), 
+                f"yolo_detection_video_{timestamp}.mp4"
+            )
+            self.get_logger().info(f"Video will be saved as: {self.video_filename}")
+        else:
+            self.get_logger().info("Frame saving DISABLED - no video will be created")
 
         if self.show_debug_window:
             cv2.namedWindow("RealSense", cv2.WINDOW_AUTOSIZE)
@@ -288,19 +345,132 @@ class YoloImageNode(Node):
             cv2.imshow("RealSense", annotated_frame)
             cv2.waitKey(1)
 
+        # Save frame if enabled
+        if self.save_frames or self.create_video:
+            if hasattr(self, 'frames_dir'):
+                frame_filename = os.path.join(self.frames_dir, f"frame_{self.frame_count:06d}.jpg")
+                success = cv2.imwrite(frame_filename, annotated_frame)
+                if success:
+                    self.saved_frames.append(frame_filename)
+                    self.frame_count += 1
+                    
+                    # Log progress every 100 frames
+                    if self.frame_count % 100 == 0:
+                        self.get_logger().info(f"Saved {self.frame_count} frames so far...")
+                else:
+                    self.get_logger().warning(f"Failed to save frame {self.frame_count}")
+            else:
+                self.get_logger().warning("Frame saving enabled but frames_dir not initialized")
+
         if self.enable_debug_publish:
             msg = self.bridge.cv2_to_imgmsg(annotated_frame, encoding="bgr8")
             self.webcam_publisher.publish(msg)
+
+    def create_video_from_frames(self):
+        """Create video from saved frames"""
+        if not (self.save_frames or self.create_video) or not self.saved_frames:
+            self.get_logger().info(f"Video creation skipped. save_frames={self.save_frames}, create_video={self.create_video}, frames_count={len(self.saved_frames) if hasattr(self, 'saved_frames') else 0}")
+            return
+            
+        try:
+            duration_seconds = len(self.saved_frames) / self.video_fps
+            self.get_logger().info(f"Creating video from {len(self.saved_frames)} frames (estimated duration: {duration_seconds:.1f}s at {self.video_fps}fps)...")
+            
+            # Read first frame to get dimensions
+            first_frame = cv2.imread(self.saved_frames[0])
+            if first_frame is None:
+                self.get_logger().error("Could not read first frame for video creation")
+                return
+                
+            height, width, layers = first_frame.shape
+            self.get_logger().info(f"Video dimensions: {width}x{height}")
+            
+            # Define codec and create VideoWriter
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            video_writer = cv2.VideoWriter(
+                self.video_filename, 
+                fourcc, 
+                self.video_fps, 
+                (width, height)
+            )
+            
+            if not video_writer.isOpened():
+                self.get_logger().error("Failed to open video writer")
+                return
+            
+            # Write all frames to video
+            frames_written = 0
+            for i, frame_path in enumerate(self.saved_frames):
+                frame = cv2.imread(frame_path)
+                if frame is not None:
+                    video_writer.write(frame)
+                    frames_written += 1
+                    
+                    # Progress update every 100 frames
+                    if (i + 1) % 100 == 0:
+                        self.get_logger().info(f"Writing frame {i + 1}/{len(self.saved_frames)} to video...")
+                else:
+                    self.get_logger().warning(f"Could not read frame: {frame_path}")
+            
+            video_writer.release()
+            self.get_logger().info(f"Video created successfully: {self.video_filename}")
+            self.get_logger().info(f"Final video stats: {frames_written} frames written, duration: {frames_written/self.video_fps:.1f}s")
+            
+            # Optionally clean up frame files
+            if not self.save_frames:  # Only delete frames if we don't want to keep them
+                self.get_logger().info("Cleaning up temporary frame files...")
+                for frame_path in self.saved_frames:
+                    try:
+                        os.remove(frame_path)
+                    except OSError as e:
+                        self.get_logger().warning(f"Could not remove frame {frame_path}: {e}")
+                        
+                # Remove frames directory if empty
+                try:
+                    os.rmdir(self.frames_dir)
+                except OSError:
+                    pass  # Directory not empty or other error
+                    
+        except Exception as e:
+            self.get_logger().error(f"Error creating video: {e}")
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = YoloImageNode()
+    
+    # Global variable to track if we're already shutting down
+    shutdown_in_progress = False
+    
+    def signal_handler(signum, frame):
+        nonlocal shutdown_in_progress
+        if shutdown_in_progress:
+            node.get_logger().warn("Second interrupt received! Force terminating without video creation...")
+            sys.exit(1)
+        else:
+            shutdown_in_progress = True
+            node.get_logger().info("Interrupt received, creating video before shutdown (press Ctrl+C again to force quit)...")
+            raise KeyboardInterrupt()
+    
+    # Register signal handler for graceful shutdown
+    signal.signal(signal.SIGINT, signal_handler)
+    
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.get_logger().info("Keyboard interrupt received, shutting down...")
+        node.get_logger().info("Shutting down gracefully...")
     finally:
+        # Create video from saved frames before cleanup
+        if hasattr(node, 'create_video_from_frames') and not shutdown_in_progress:
+            node.create_video_from_frames()
+        elif hasattr(node, 'create_video_from_frames'):
+            try:
+                # Give it a chance even if shutdown is in progress
+                node.get_logger().info("Creating video during shutdown...")
+                node.create_video_from_frames()
+            except Exception as e:
+                node.get_logger().error(f"Failed to create video during shutdown: {e}")
+            
         if hasattr(node, "cap") and node.cap is not None:
             node.cap.release()
         node.destroy_node()

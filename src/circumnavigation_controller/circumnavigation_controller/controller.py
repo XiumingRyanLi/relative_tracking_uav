@@ -11,6 +11,7 @@ from rclpy.executors import MultiThreadedExecutor
 
 from std_msgs.msg import Float64, Bool
 from geometry_msgs.msg import PoseStamped, TwistStamped
+from sensor_msgs.msg import NavSatFix
 from mavros_msgs.msg import State
 from mavros_msgs.srv import CommandBool, CommandTOL, SetMode, MessageInterval
 
@@ -33,8 +34,10 @@ class CircumnavigationController(Node):
 
         self.state_sub = self.create_subscription( State, '/mavros/state', self._on_state, state_qos)
         self.pose_sub = self.create_subscription(PoseStamped, '/mavros/local_position/pose', self._on_pose, pose_qos)
+        self.global_pos_sub = self.create_subscription(NavSatFix, '/mavros/global_position/global', self._on_global_position, pose_qos)
 
         self.compass_sub = self.create_subscription(Float64, '/mavros/global_position/compass_hdg', self._on_compass, pose_qos)
+
 
         self.err_sub = self.create_subscription( Float64, '/yaw_error', self._on_person_error, 10)
         self.bearing_sub = self.create_subscription(Float64, '/bearing', self._on_bearing, 10)
@@ -50,6 +53,7 @@ class CircumnavigationController(Node):
 
         self.state = State()
         self.pose = PoseStamped()
+        self.global_pos = NavSatFix()
         self.person_err = 0.0
         self.bearing = 0.0
         self.compass_hdg = 0.0
@@ -66,7 +70,7 @@ class CircumnavigationController(Node):
         self.csv_file = open(self.csv_filename, 'w', newline='')
         self.csv_writer = csv.writer(self.csv_file)
         self.csv_writer.writerow([
-            'timestamp', 'x', 'y', 'z', 'compass_hdg', 'bearing', 'yaw_error', 
+            'timestamp', 'x', 'y', 'z', 'latitude', 'longitude', 'global_altitude', 'compass_hdg', 'bearing', 'yaw_error', 
             'vel_x', 'vel_y', 'vel_z', 'yaw_rate', 
             'estimated_state_x', 'estimated_state_y','desired_radius','distance_error'
         ])
@@ -173,6 +177,9 @@ class CircumnavigationController(Node):
             self._takeoff_complete_time = self.get_clock().now().nanoseconds / 1e9
             self.get_logger().info(f'Takeoff complete at {alt:.2f} m - Starting 60s safety timer')
             self._enable_tracking()
+
+    def _on_global_position(self, msg: NavSatFix):
+        self.global_pos = msg
 
     def _on_person_error(self, msg: Float64):
         self.person_err = float(msg.data)
@@ -383,6 +390,9 @@ class CircumnavigationController(Node):
                 self.pose.pose.position.x,
                 self.pose.pose.position.y, 
                 self.pose.pose.position.z,
+                self.global_pos.latitude,
+                self.global_pos.longitude,
+                self.global_pos.altitude,
                 self.compass_hdg,
                 self.bearing,
                 self.person_err,
@@ -443,6 +453,9 @@ class CircumnavigationController(Node):
             self.pose.pose.position.x,
             self.pose.pose.position.y, 
             self.pose.pose.position.z,
+            self.global_pos.latitude,
+            self.global_pos.longitude,
+            self.global_pos.altitude,
             self.compass_hdg,
             self.bearing,
             self.person_err,
