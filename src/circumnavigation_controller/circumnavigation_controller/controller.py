@@ -18,6 +18,8 @@ from mavros_msgs.srv import CommandBool, CommandTOL, SetMode, MessageInterval
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from rclpy.qos import qos_profile_sensor_data
 
+from .implimented_controllers import MD_Controller, MDV_Controller, DKR_Controller, KRV_Controller
+
 
 
 class CircumnavigationController(Node):
@@ -58,12 +60,14 @@ class CircumnavigationController(Node):
         self.bearing = 0.0
         self.compass_hdg = 0.0
 
-        self.target_altitude = 4.0
-        self.tangential_speed = 0.8
-        self.parallel_speed = 0.4
+        self.target_altitude = 3.0
+        self.tangential_speed = 1.0
+        self.parallel_speed = 0.30
         self.yaw_kp = 1.5
+        self.yaw_ki = 0.025
         self.max_yaw_rate = 2.0
         self._last_yaw_rate = 0.0
+        self.yaw_integral_error = 0.0
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.csv_filename = f"circumnavigation_data_{timestamp}.csv"
@@ -91,7 +95,6 @@ class CircumnavigationController(Node):
         self._takeoff_complete_time = None
         self._rtl_initiated = False
 
-        # Safety boundaries (30x30m square centered at origin)
         self.boundary_limit = 25.0  # 15m from center in any direction
         
         self.orchestrator = self.create_timer(0.2, self._orchestrate)
@@ -102,6 +105,9 @@ class CircumnavigationController(Node):
         self.estimated_state = np.array([0.0, 0.0])
         self.desired_radius = 5.0
         self.estimated_error = 0.0
+        self.P = np.zeros((2,2))
+        self.Q = np.zeros((2,1))
+        self.counter = 0
 
         # Set MAVROS message intervals
         self._set_message_intervals()
@@ -152,15 +158,10 @@ class CircumnavigationController(Node):
             self._armed_confirmed = True
             self._armed_time = self.get_clock().now().nanoseconds / 1e9
             
-            # Initialize estimated state based on compass heading (drone facing target)
-            # Convert compass heading to radians (compass: 0=North, clockwise positive)
-            # In NED frame: North=+Y, East=+X
             compass_rad = math.radians(self.compass_hdg)
             
-            # Calculate target position 6m behind drone (opposite to facing direction)
-            # If drone faces target, target is 6m in the direction drone is facing
-            target_x = self.pose.pose.position.x + 6.0 * math.sin(compass_rad)
-            target_y = self.pose.pose.position.y + 6.0 * math.cos(compass_rad)
+            target_x = self.pose.pose.position.x + 7.0 * math.sin(compass_rad)
+            target_y = self.pose.pose.position.y + 7.0 * math.cos(compass_rad)
             
             self.estimated_state = np.array([target_x, target_y])
             
@@ -327,7 +328,7 @@ class CircumnavigationController(Node):
         # Check 120-second timer after takeoff
         if self._takeoff_complete_time is not None:
             elapsed_since_takeoff = current_time - self._takeoff_complete_time
-            if elapsed_since_takeoff >= 120.0:
+            if elapsed_since_takeoff >= 60.0:
                 self.get_logger().warn('120 seconds elapsed since takeoff - Initiating RTL')
                 self._initiate_rtl('120-second timer expired')
                 return
@@ -373,17 +374,11 @@ class CircumnavigationController(Node):
         else:
             self.get_logger().error(f'RTL command rejected by FCU (reason: {reason})')
 
+
     def _publish_setpoint(self):
-        msg = TwistStamped()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = 'base_link'
-        
-        yaw_rate = 0.0
         
         # Don't send velocity commands if RTL has been initiated
         if self._rtl_initiated:
-            # Send zero velocity to stop any movement
-            self.vel_pub.publish(msg)
             current_time = self.get_clock().now().nanoseconds / 1e9
             self.csv_writer.writerow([
                 current_time,
@@ -408,44 +403,12 @@ class CircumnavigationController(Node):
             self.csv_file.flush()
             return
             
-        if self._tracking_enabled:
+    
 
-            yaw_rate = -self.yaw_kp * self.person_err
-            yaw_rate = max(min(yaw_rate, self.max_yaw_rate), -self.max_yaw_rate)
-            tangential_angle = self.bearing + math.pi/2
-
-
-            bearing_vector = np.array([math.sin(self.bearing), math.cos(self.bearing)])
-
-
-            Projection_matrix = np.outer(bearing_vector, bearing_vector)
-            I = np.eye(2)
-            Q = I - Projection_matrix
-            position =  [self.pose.pose.position.x, self.pose.pose.position.y]
-            estimator_state_update = self.estimator_gain * Q @ (position - self.estimated_state)
-            self.estimated_state += estimator_state_update / 20
-
-
-            estimated_distance_to_target = np.linalg.norm(position - self.estimated_state[:2])
-            self.estimated_error = estimated_distance_to_target - self.desired_radius
-            
-            msg.twist.linear.x = float(self.tangential_speed * math.sin(tangential_angle) + self.parallel_speed * self.estimated_error * math.sin(self.bearing))
-            msg.twist.linear.y = float(self.tangential_speed * math.cos(tangential_angle) + self.parallel_speed * self.estimated_error * math.cos(self.bearing))
-
-            msg.twist.angular.z = float(yaw_rate)
-            
-            self.get_logger().info(f'NEW ITERATION ')
-            self.get_logger().info(f'Bearing {self.bearing:.1f} Tangential angle {tangential_angle:.1f}...')
-            est_state = [self.estimated_state[0], self.estimated_state[1]]
-            self.get_logger().info(f'Position {position} est pos {est_state}')
-            self.get_logger().info(f'Est Distance {estimated_distance_to_target:.1f} Desired {self.desired_radius:.1f} Distance Error {self.estimated_error:.1f}')
-            self.get_logger().info(f'Towards Target speed {(self.parallel_speed * self.estimated_error):.1f}')
-            
-
-
-
-            self.vel_pub.publish(msg)
-
+        #msg = MD_Controller(self)
+        #msg = MDV_Controller(self)
+        #msg = DKR_Controller(self)
+        msg = KRV_Controller(self)
 
         current_time = self.get_clock().now().nanoseconds / 1e9
         self.csv_writer.writerow([

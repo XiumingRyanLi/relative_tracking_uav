@@ -8,7 +8,7 @@ import matplotlib.patches as patches
 
 def animate_circumnavigation_data():
     # Load the CSV data
-    csv_file = 'circumnavigation_data_20250908_152645.csv'
+    csv_file = 'kvr_sim.csv'
     data = pd.read_csv(csv_file)
     
     # Filter out entries where estimated state is [0,0]
@@ -41,6 +41,8 @@ def animate_circumnavigation_data():
     
     # Add estimated target circle at [0,5]
 
+    target_circle = plt.Circle((0, 5), 0.5, color='orange', fill=False, linestyle='--', linewidth=2, label='Target Location (0,5)')
+    ax1.add_patch(target_circle)
     
     # Drone orientation arrow (made bigger)
     arrow_length = 3.0  # Increased from 0.5
@@ -142,8 +144,11 @@ def animate_circumnavigation_data():
 
 def plot_circumnavigation_data():
     # Load the CSV data
-    csv_file = 'circumnavigation_data_20250908_152645.csv'
+   #csv_file = 'circumnavigation_data_20250908_152645.csv'
     #csv_file = 'circumnavigation_data_20250908_153522.csv'  # IGNORE
+    csv_file = 'KVR_2.csv'
+
+
     data = pd.read_csv(csv_file)
     
     # Filter out entries where estimated state is [0,0]
@@ -178,7 +183,9 @@ def plot_circumnavigation_data():
     # Set equal aspect ratio and add grid for first subplot
     ax1.set_aspect('equal')
     ax1.grid(True, alpha=0.3)
-    
+
+    # Plot the target location as a dot at (0, 5)
+    ax1.plot(0, 5, 'o', color='orange', markersize=10, label='Target Location (0,5)')
     # Add labels and title for first subplot
     ax1.set_xlabel('X Position (m)')
     ax1.set_ylabel('Y Position (m)')
