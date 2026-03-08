@@ -21,11 +21,12 @@ setup(
     maintainer_email='mitch.torok@gmail.com',
     description='TODO: Package description',
     license='TODO: License declaration',
-    tests_require=['pytest'],
+    
     entry_points={
         'console_scripts': [
             'bearing_measurement_generation = circumnavigation_controller.bearing_measurement_generation:main',
-            'controller = circumnavigation_controller.controller:main'
+            'controller = circumnavigation_controller.controller:main',
+            'relative_position_controller = circumnavigation_controller.relative_position_controller:main'
         ],
     },
 )

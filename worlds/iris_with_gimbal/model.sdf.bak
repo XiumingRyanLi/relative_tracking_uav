@@ -7,9 +7,9 @@
 
     <!-- Fixed camera mount -->
     <link name="camera_link">
-      <pose degrees="true">0.1 0 0 90 0 90</pose>
+      <pose degrees="true">0.0 0.0 -0.124923 105 0 90</pose>
       <inertial>
-        <mass>0.075</mass>
+        <mass>0.05</mass>
         <inertia>
           <ixx>0.00001</ixx>
           <ixy>0</ixy>
@@ -23,9 +23,10 @@
       <!-- Camera visual -->
       <visual name="camera_visual">
         <geometry>
-          <box>
-            <size>0.090 0.025 0.025</size>
-          </box>
+          <cylinder>
+            <radius>0.025</radius>
+            <length>0.050</length>
+          </cylinder>
         </geometry>
         <material>
           <ambient>0.2 0.2 0.2</ambient>
@@ -50,8 +51,8 @@
         <camera>
           <horizontal_fov>0.8</horizontal_fov>
           <image>
-            <width>1280</width>
-            <height>720</height>
+            <width>640</width>
+            <height>480</height>
           </image>
           <clip>
             <near>0.05</near>
@@ -70,32 +71,6 @@
           <use_cuda>false</use_cuda>
         </plugin>
       </sensor>
-
-      <sensor name="d435_depth" type="depth_camera">
-				<always_on>1</always_on>
-				<update_rate>30</update_rate>
-				<visualize>0</visualize>
-				<topic>/camera/depth</topic>
-				<pose>0 0 0 0 0 0</pose>
-        <frame_id>camera_link</frame_id> 
-				<camera name="d435">
-					<horizontal_fov>1.48702</horizontal_fov>
-					<image>
-						<width>1280</width>
-						<height>720</height>
-					</image>
-					<clip>
-						<near>0.1</near>
-						<far>100</far>
-					</clip>
-					<noise>
-						<type>gaussian</type>
-						<mean>0</mean>
-						<stddev>0.1</stddev>
-					</noise>
-				</camera>
-			</sensor>
-
     </link>
 
     <!-- Fixed joint to attach camera to base -->
