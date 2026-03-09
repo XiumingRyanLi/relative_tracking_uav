@@ -2,8 +2,8 @@
 import rclpy
 import math
 import csv
-import os
-import numpy as np
+# import os
+# import numpy as np
 from datetime import datetime
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
@@ -16,9 +16,9 @@ from mavros_msgs.msg import State
 from mavros_msgs.srv import CommandBool, CommandTOL, SetMode, MessageInterval
 
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from rclpy.qos import qos_profile_sensor_data
+# from rclpy.qos import qos_profile_sensor_data
 
-from .implimented_controllers import MD_Controller, MDV_Controller, DKR_Controller, KRV_Controller
+# from .implimented_controllers import MD_Controller, MDV_Controller, DKR_Controller, KRV_Controller
 
 
 
@@ -41,9 +41,9 @@ class RelativePositionController(Node):
         self.compass_sub = self.create_subscription(Float64, '/mavros/global_position/compass_hdg', self._on_compass, pose_qos)
 
 
-        self.err_sub = self.create_subscription( Float64, '/yaw_error', self._on_person_error, 10)
-        self.bearing_sub = self.create_subscription(Float64, '/bearing', self._on_bearing, 10)
-        self.tracking_enable_sub = self.create_subscription(Bool, '/tracking_enable', self._on_tracking_enable, 10)
+        # self.err_sub = self.create_subscription( Float64, '/yaw_error', self._on_person_error, 10)
+        # self.bearing_sub = self.create_subscription(Float64, '/bearing', self._on_bearing, 10)
+        # self.tracking_enable_sub = self.create_subscription(Bool, '/tracking_enable', self._on_tracking_enable, 10)
 
         self.pos_pub = self.create_publisher(PoseStamped, '/mavros/setpoint_position/local', 10)
         self.setpoint_timer = self.create_timer(0.15, self._publish_setpoint)
@@ -56,27 +56,31 @@ class RelativePositionController(Node):
         self.state = State()
         self.pose = PoseStamped()
         self.global_pos = NavSatFix()
-        self.person_err = 0.0
-        self.bearing = 0.0
         self.compass_hdg = 0.0
 
+        self.have_local_pose = False
+        self.have_global_pose = False
+
         self.target_altitude = 3.0
-        self.tangential_speed = 1.0
-        self.parallel_speed = 0.30
-        self.yaw_kp = 1.5
-        self.yaw_ki = 0.025
-        self.max_yaw_rate = 2.0
-        self._last_yaw_rate = 0.0
-        self.yaw_integral_error = 0.0
+        
+        self.target_x = 0.0
+        self.target_y = 5.0
+        self.target_z = 0.0
+        self.target_heading = 0.0   # radians, dummy for now
+
+        self.range_r = 10.0
+        self.azimuth_offset = math.radians(50.0)
+        self.elevation_offset = math.radians(20.0)
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.csv_filename = f"circumnavigation_data_{timestamp}.csv"
+        self.csv_filename = f"relative_pose_control_data_{timestamp}.csv"
         self.csv_file = open(self.csv_filename, 'w', newline='')
         self.csv_writer = csv.writer(self.csv_file)
         self.csv_writer.writerow([
-            'timestamp', 'x', 'y', 'z', 'latitude', 'longitude', 'global_altitude', 'compass_hdg', 'bearing', 'yaw_error', 
-            'vel_x', 'vel_y', 'vel_z', 'yaw_rate', 
-            'estimated_state_x', 'estimated_state_y','desired_radius','distance_error'
+            'timestamp', 'drone_x', 'drone_y', 'drone_z',
+            'target_x', 'target_y', 'target_z',
+            'desired_x', 'desired_y', 'desired_z',
+            'target_heading', 'desired_yaw'
         ])
         self.get_logger().info(f'CSV logging initialized: {self.csv_filename}')
 
@@ -90,7 +94,7 @@ class RelativePositionController(Node):
         self._tko_reached = False
 
         self._tracking_enabled = False
-        self._tracking_manual_override = False
+        # self._tracking_manual_override = False
         self._armed_time = None
         self._takeoff_complete_time = None
         self._rtl_initiated = False
@@ -101,18 +105,10 @@ class RelativePositionController(Node):
         self.safety_timer = self.create_timer(1.0, self._check_safety_conditions)
 
 
-        self.estimator_gain = 0.1
-        self.estimated_state = np.array([0.0, 0.0])
-        self.desired_radius = 5.0
-        self.estimated_error = 0.0
-        self.P = np.zeros((2,2))
-        self.Q = np.zeros((2,1))
-        self.counter = 0
-
         # Set MAVROS message intervals
         self._set_message_intervals()
 
-        self.get_logger().info('Circumnavigation Controller (callbacks) started')
+        self.get_logger().info('Relative Position Controller started')
 
     def _set_message_intervals(self):
         """Set MAVROS message intervals for global position and compass to 30Hz"""
@@ -158,15 +154,8 @@ class RelativePositionController(Node):
             self._armed_confirmed = True
             self._armed_time = self.get_clock().now().nanoseconds / 1e9
             
-            compass_rad = math.radians(self.compass_hdg)
             
-            target_x = self.pose.pose.position.x + 7.0 * math.sin(compass_rad)
-            target_y = self.pose.pose.position.y + 7.0 * math.cos(compass_rad)
-            
-            self.estimated_state = np.array([target_x, target_y])
-            
-            self.get_logger().info(f'Armed confirmed by FCU. Compass: {self.compass_hdg:.1f}°')
-            self.get_logger().info(f'Estimated target at: ({target_x:.2f}, {target_y:.2f})')
+            self.get_logger().info('Armed confirmed by FCU.')
 
 
     def _on_pose(self, msg: PoseStamped):
@@ -182,23 +171,9 @@ class RelativePositionController(Node):
     def _on_global_position(self, msg: NavSatFix):
         self.global_pos = msg
 
-    def _on_person_error(self, msg: Float64):
-        self.person_err = float(msg.data)
-
-    def _on_bearing(self, msg: Float64):
-        self.bearing = float(msg.data)
 
     def _on_compass(self, msg: Float64):
         self.compass_hdg = float(msg.data)
-
-    def _on_tracking_enable(self, msg: Bool):
-        """Handle manual tracking enable/disable commands"""
-        self._tracking_manual_override = msg.data
-        if msg.data:
-            self._enable_tracking_manual()
-        else:
-            self._disable_tracking_manual()
-        self.get_logger().info(f'Manual tracking override: {"ENABLED" if msg.data else "DISABLED"}')
 
     def _orchestrate(self):
         if not self.state.connected:
@@ -306,18 +281,6 @@ class RelativePositionController(Node):
             self._tracking_enabled = True
             self.get_logger().info('Tracking enabled (automatic - takeoff complete).')
 
-    def _enable_tracking_manual(self):
-        """Enable tracking manually via topic command"""
-        if not self._tracking_enabled:
-            self._tracking_enabled = True
-            self.get_logger().info('Tracking enabled (manual override).')
-
-    def _disable_tracking_manual(self):
-        """Disable tracking manually via topic command"""
-        if self._tracking_enabled:
-            self._tracking_enabled = False
-            self.get_logger().info('Tracking disabled (manual override).')
-
     def _check_safety_conditions(self):
         """Check safety conditions and initiate RTL if necessary"""
         if self._rtl_initiated or not self._tko_reached:
@@ -328,7 +291,7 @@ class RelativePositionController(Node):
         # Check 120-second timer after takeoff
         if self._takeoff_complete_time is not None:
             elapsed_since_takeoff = current_time - self._takeoff_complete_time
-            if elapsed_since_takeoff >= 60.0:
+            if elapsed_since_takeoff >= 120.0:
                 self.get_logger().warn('120 seconds elapsed since takeoff - Initiating RTL')
                 self._initiate_rtl('120-second timer expired')
                 return
@@ -376,61 +339,104 @@ class RelativePositionController(Node):
 
 
     def _publish_setpoint(self):
-        
-        # Don't send velocity commands if RTL has been initiated
+
+        # Don't send position commands if RTL has been initiated
         if self._rtl_initiated:
             current_time = self.get_clock().now().nanoseconds / 1e9
             self.csv_writer.writerow([
                 current_time,
                 self.pose.pose.position.x,
-                self.pose.pose.position.y, 
+                self.pose.pose.position.y,
                 self.pose.pose.position.z,
-                self.global_pos.latitude,
-                self.global_pos.longitude,
-                self.global_pos.altitude,
-                self.compass_hdg,
-                self.bearing,
-                self.person_err,
-                0.0,  # Zero velocities during RTL
+                self.target_x,
+                self.target_y,
+                self.target_z,
+                self.pose.pose.position.x,
+                self.pose.pose.position.y,
+                self.pose.pose.position.z,
+                self.target_heading,
                 0.0,
-                0.0,
-                0.0,
-                self.estimated_state[0],
-                self.estimated_state[1],
-                self.desired_radius,
-                self.estimated_error,
             ])
             self.csv_file.flush()
             return
-            
-    
 
-        #msg = MD_Controller(self)
-        #msg = MDV_Controller(self)
-        #msg = DKR_Controller(self)
-        msg = KRV_Controller(self)
+        # Before takeoff is complete, hold current XY and command takeoff altitude only
+        if not self._tko_reached:
+            msg = PoseStamped()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.header.frame_id = 'map'
+
+            msg.pose.position.x = self.pose.pose.position.x
+            msg.pose.position.y = self.pose.pose.position.y
+            msg.pose.position.z = self.target_altitude
+
+            msg.pose.orientation.x = 0.0
+            msg.pose.orientation.y = 0.0
+            msg.pose.orientation.z = 0.0
+            msg.pose.orientation.w = 1.0
+
+            self.pos_pub.publish(msg)
+
+            current_time = self.get_clock().now().nanoseconds / 1e9
+            self.csv_writer.writerow([
+                current_time,
+                self.pose.pose.position.x,
+                self.pose.pose.position.y,
+                self.pose.pose.position.z,
+                self.target_x,
+                self.target_y,
+                self.target_z,
+                msg.pose.position.x,
+                msg.pose.position.y,
+                msg.pose.position.z,
+                self.target_heading,
+                0.0,
+            ])
+            self.csv_file.flush()
+            return
+
+        psi = self.target_heading + self.azimuth_offset
+        r_xy = self.range_r * math.cos(self.elevation_offset)
+        dz = self.range_r * math.sin(self.elevation_offset)
+
+        dx = r_xy * math.cos(psi)
+        dy = r_xy * math.sin(psi)
+
+        desired_x = self.target_x + dx
+        desired_y = self.target_y + dy
+        desired_z = self.target_z + dz
+
+        desired_yaw = math.atan2(self.target_y - desired_y, self.target_x - desired_x)
+
+        msg = PoseStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = 'map'
+
+        msg.pose.position.x = desired_x
+        msg.pose.position.y = desired_y
+        msg.pose.position.z = desired_z
+
+        msg.pose.orientation.x = 0.0
+        msg.pose.orientation.y = 0.0
+        msg.pose.orientation.z = math.sin(desired_yaw / 2.0)
+        msg.pose.orientation.w = math.cos(desired_yaw / 2.0)
+
+        self.pos_pub.publish(msg)
 
         current_time = self.get_clock().now().nanoseconds / 1e9
         self.csv_writer.writerow([
             current_time,
             self.pose.pose.position.x,
-            self.pose.pose.position.y, 
+            self.pose.pose.position.y,
             self.pose.pose.position.z,
-            self.global_pos.latitude,
-            self.global_pos.longitude,
-            self.global_pos.altitude,
-            self.compass_hdg,
-            self.bearing,
-            self.person_err,
-            msg.twist.linear.x,
-            msg.twist.linear.y,
-            msg.twist.linear.z,
-            msg.twist.angular.z,
-            self.estimated_state[0],
-            self.estimated_state[1],
-            self.desired_radius,
-            self.estimated_error,
-
+            self.target_x,
+            self.target_y,
+            self.target_z,
+            desired_x,
+            desired_y,
+            desired_z,
+            self.target_heading,
+            desired_yaw,
         ])
         self.csv_file.flush()
 

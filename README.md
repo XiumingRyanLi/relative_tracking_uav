@@ -98,4 +98,6 @@ ros2 run circumnavigation_controller bearing_measurement_generation
 ```bash
 source install/setup.bash
 ros2 run circumnavigation_controller controller
+
+ros2 run circumnavigation_controller relative_position_controller
 ```
