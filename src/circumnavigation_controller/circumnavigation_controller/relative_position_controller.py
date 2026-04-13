@@ -2,25 +2,18 @@
 import rclpy
 import math
 import csv
-# import os
-# import numpy as np
 from datetime import datetime
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from rclpy.executors import MultiThreadedExecutor
 
-from std_msgs.msg import Float64, Bool
+from std_msgs.msg import Float64
 from geometry_msgs.msg import PoseStamped, TwistStamped
 from sensor_msgs.msg import NavSatFix
 from mavros_msgs.msg import State
 from mavros_msgs.srv import CommandBool, CommandTOL, SetMode, MessageInterval
 
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-# from rclpy.qos import qos_profile_sensor_data
-
-# from .implimented_controllers import MD_Controller, MDV_Controller, DKR_Controller, KRV_Controller
-
-
+from tf2_msgs.msg import TFMessage
 
 class RelativePositionController(Node):
     def __init__(self):
@@ -32,57 +25,108 @@ class RelativePositionController(Node):
             depth=10
         )
 
-        pose_qos = QoSProfile( reliability=ReliabilityPolicy.BEST_EFFORT, durability=DurabilityPolicy.VOLATILE, history=HistoryPolicy.KEEP_LAST, depth=10)
+        pose_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10
+        )
 
-        self.state_sub = self.create_subscription( State, '/mavros/state', self._on_state, state_qos)
-        self.pose_sub = self.create_subscription(PoseStamped, '/mavros/local_position/pose', self._on_pose, pose_qos)
-        self.global_pos_sub = self.create_subscription(NavSatFix, '/mavros/global_position/global', self._on_global_position, pose_qos)
+        self.state_sub = self.create_subscription(
+            State, '/mavros/state', self._on_state, state_qos
+        )
+        self.pose_sub = self.create_subscription(
+            PoseStamped, '/mavros/local_position/pose', self._on_pose, pose_qos
+        )
+        self.global_pos_sub = self.create_subscription(
+            NavSatFix, '/mavros/global_position/global', self._on_global_position, pose_qos
+        )
+        self.compass_sub = self.create_subscription(
+            Float64, '/mavros/global_position/compass_hdg', self._on_compass, pose_qos
+        )
 
-        self.compass_sub = self.create_subscription(Float64, '/mavros/global_position/compass_hdg', self._on_compass, pose_qos)
+        self.vel_pub = self.create_publisher(
+            TwistStamped, '/mavros/setpoint_velocity/cmd_vel', 10
+        )
 
-
-        # self.err_sub = self.create_subscription( Float64, '/yaw_error', self._on_person_error, 10)
-        # self.bearing_sub = self.create_subscription(Float64, '/bearing', self._on_bearing, 10)
-        # self.tracking_enable_sub = self.create_subscription(Bool, '/tracking_enable', self._on_tracking_enable, 10)
-
-        self.pos_pub = self.create_publisher(PoseStamped, '/mavros/setpoint_position/local', 10)
         self.setpoint_timer = self.create_timer(0.15, self._publish_setpoint)
+        self.rel_update_timer = self.create_timer(0.5, self._update_relative_target)
+
+        # Useless now
+        self.target_pose_sub = self.create_subscription(
+            TFMessage,
+            '/world/iris_runway/dynamic_pose/info',
+            self._on_target_pose,
+            10
+        )
+
+        self.fake_target_timer = self.create_timer(0.1, self._update_fake_target_pose)
+
+
+
+
 
         self.set_mode_client = self.create_client(SetMode, '/mavros/set_mode')
         self.arming_client = self.create_client(CommandBool, '/mavros/cmd/arming')
         self.takeoff_client = self.create_client(CommandTOL, '/mavros/cmd/takeoff')
-        self.message_interval_client = self.create_client(MessageInterval, '/mavros/set_message_interval')
+        self.message_interval_client = self.create_client(
+            MessageInterval, '/mavros/set_message_interval'
+        )
 
         self.state = State()
         self.pose = PoseStamped()
         self.global_pos = NavSatFix()
         self.compass_hdg = 0.0
-
         self.have_local_pose = False
-        self.have_global_pose = False
 
         self.target_altitude = 3.0
-        
+
+        # Hardcoded target state for proof-of-concept
         self.target_x = 0.0
         self.target_y = 5.0
         self.target_z = 0.0
-        self.target_heading = 0.0   # radians, dummy for now
+        self.target_heading = math.pi / 2.0  # north in ENU assumption
 
-        self.range_r = 10.0
-        self.azimuth_offset = math.radians(50.0)
-        self.elevation_offset = math.radians(20.0)
+        # Relative coordinate in target body frame
+        self.rel_x_body = -4.0
+        self.rel_y_body = 3.0
+        self.rel_z_body = 3.0
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.csv_filename = f"relative_pose_control_data_{timestamp}.csv"
-        self.csv_file = open(self.csv_filename, 'w', newline='')
-        self.csv_writer = csv.writer(self.csv_file)
-        self.csv_writer.writerow([
-            'timestamp', 'drone_x', 'drone_y', 'drone_z',
-            'target_x', 'target_y', 'target_z',
-            'desired_x', 'desired_y', 'desired_z',
-            'target_heading', 'desired_yaw'
-        ])
-        self.get_logger().info(f'CSV logging initialized: {self.csv_filename}')
+        # PID gains
+        self.kp_x = 0.45
+        self.ki_x = 0.02
+        self.kd_x = 0.10
+
+        self.kp_y = 0.45
+        self.ki_y = 0.02
+        self.kd_y = 0.10
+
+        self.kp_z = 0.60
+        self.ki_z = 0.03
+        self.kd_z = 0.10
+
+        self.kp_yaw = 0.8
+        self.ki_yaw = 0.00
+        self.kd_yaw = 0.00
+
+        self.int_ex = 0.0
+        self.int_ey = 0.0
+        self.int_ez = 0.0
+        self.int_eyaw = 0.0
+
+        self.prev_ex = 0.0
+        self.prev_ey = 0.0
+        self.prev_ez = 0.0
+        self.prev_eyaw = 0.0
+
+        self.dt = 0.15
+
+        self.max_vel_xy = 1.5
+        self.max_vel_z = 0.8
+        self.max_yaw_rate = 1.0
+        self.max_integral_xy = 3.0
+        self.max_integral_z = 2.0
+        self.max_integral_yaw = 2.0
 
         self._guided_requested = False
         self._guided_confirmed = False
@@ -94,44 +138,57 @@ class RelativePositionController(Node):
         self._tko_reached = False
 
         self._tracking_enabled = False
-        # self._tracking_manual_override = False
+        self._hover_stable = False
         self._armed_time = None
         self._takeoff_complete_time = None
         self._rtl_initiated = False
 
-        self.boundary_limit = 25.0  # 15m from center in any direction
-        
+        # Stage-2 enable delay after takeoff complete
+        self.hover_delay_sec = 4.0
+
+        self.boundary_limit = 25.0
         self.orchestrator = self.create_timer(0.2, self._orchestrate)
         self.safety_timer = self.create_timer(1.0, self._check_safety_conditions)
 
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.csv_filename = f"relative_velocity_pid_{timestamp}.csv"
+        self.csv_file = open(self.csv_filename, 'w', newline='')
+        self.csv_writer = csv.writer(self.csv_file)
+        self.csv_writer.writerow([
+            'timestamp',
+            'stage',
+            'drone_x', 'drone_y', 'drone_z',
+            'target_x', 'target_y', 'target_z',
+            'desired_x', 'desired_y', 'desired_z',
+            'ex', 'ey', 'ez', 'eyaw',
+            'vx', 'vy', 'vz', 'yaw_rate'
+        ])
 
-        # Set MAVROS message intervals
         self._set_message_intervals()
-
-        self.get_logger().info('Relative Position Controller started')
+        self.get_logger().info('Relative Position Controller started (2-stage mode)')
 
     def _set_message_intervals(self):
-        """Set MAVROS message intervals for global position and compass to 30Hz"""
-        self._set_single_message_interval(32, 30.0, "Global Position") 
+        self._set_single_message_interval(32, 30.0, "Global Position")
         self._set_single_message_interval(74, 30.0, "Compass Heading")
 
     def _set_single_message_interval(self, message_id, rate, description):
-        """Set a single message interval"""
         if not self.message_interval_client.wait_for_service(timeout_sec=5.0):
             self.get_logger().warn(f'MessageInterval service not ready for {description}')
             return
-            
+
         req = MessageInterval.Request()
         req.message_id = message_id
         req.message_rate = rate
-        
+
         fut = self.message_interval_client.call_async(req)
-        fut.add_done_callback(lambda f, desc=description, mid=message_id, r=rate: self._on_message_interval_done(f, desc, mid, r))
-        
+        fut.add_done_callback(
+            lambda f, desc=description, mid=message_id, r=rate:
+            self._on_message_interval_done(f, desc, mid, r)
+        )
+
         self.get_logger().info(f'Setting {description} (ID: {message_id}) to {rate}Hz...')
 
     def _on_message_interval_done(self, fut, description, message_id, rate):
-        """Handle message interval service response"""
         try:
             res = fut.result()
         except Exception as e:
@@ -141,7 +198,9 @@ class RelativePositionController(Node):
         if getattr(res, 'success', False):
             self.get_logger().info(f'{description} interval set to {rate}Hz successfully')
         else:
-            self.get_logger().warn(f'{description} interval setting failed (ID: {message_id}, Rate: {rate}Hz)')
+            self.get_logger().warn(
+                f'{description} interval setting failed (ID: {message_id}, Rate: {rate}Hz)'
+            )
 
     def _on_state(self, msg: State):
         self.state = msg
@@ -153,24 +212,20 @@ class RelativePositionController(Node):
         if self.state.armed and not self._armed_confirmed:
             self._armed_confirmed = True
             self._armed_time = self.get_clock().now().nanoseconds / 1e9
-            
-            
             self.get_logger().info('Armed confirmed by FCU.')
-
 
     def _on_pose(self, msg: PoseStamped):
         self.pose = msg
+        self.have_local_pose = True
+
         alt = msg.pose.position.z
-        
         if self._armed_confirmed and not self._tko_reached and alt > (self.target_altitude - 0.5):
             self._tko_reached = True
             self._takeoff_complete_time = self.get_clock().now().nanoseconds / 1e9
-            self.get_logger().info(f'Takeoff complete at {alt:.2f} m - Starting 60s safety timer')
-            self._enable_tracking()
+            self.get_logger().info(f'Takeoff complete at {alt:.2f} m. Entering hover stage.')
 
     def _on_global_position(self, msg: NavSatFix):
         self.global_pos = msg
-
 
     def _on_compass(self, msg: Float64):
         self.compass_hdg = float(msg.data)
@@ -184,6 +239,9 @@ class RelativePositionController(Node):
                 self._request_guided()
             return
 
+        if not self.have_local_pose:
+            return
+
         if not self._armed_confirmed:
             if not self._arm_requested:
                 self._request_arm()
@@ -193,13 +251,20 @@ class RelativePositionController(Node):
             elapsed = self.get_clock().now().nanoseconds / 1e9 - self._armed_time
             if elapsed < 5.0:
                 if not hasattr(self, '_armed_wait_logged') or not self._armed_wait_logged:
-                    self.get_logger().info("Armed. Waiting 5s before takeoff...")
+                    self.get_logger().info('Armed. Waiting 5s before takeoff...')
                     self._armed_wait_logged = True
                 return
-            else:
-                self._request_takeoff()
-                self._armed_wait_logged = False
-                return
+
+            self._request_takeoff()
+            self._armed_wait_logged = False
+            return
+
+        # Stage transition: after takeoff, wait for hover delay before enabling tracking
+        if self._tko_reached and not self._tracking_enabled and self._takeoff_complete_time is not None:
+            hover_elapsed = self.get_clock().now().nanoseconds / 1e9 - self._takeoff_complete_time
+            if hover_elapsed >= self.hover_delay_sec:
+                self._hover_stable = True
+                self._enable_tracking()
 
     def _request_guided(self):
         if not self.set_mode_client.wait_for_service(timeout_sec=0.5):
@@ -279,53 +344,47 @@ class RelativePositionController(Node):
     def _enable_tracking(self):
         if not self._tracking_enabled:
             self._tracking_enabled = True
-            self.get_logger().info('Tracking enabled (automatic - takeoff complete).')
+            self.get_logger().info('Tracking enabled. Entering Stage 2 relative control.')
 
     def _check_safety_conditions(self):
-        """Check safety conditions and initiate RTL if necessary"""
         if self._rtl_initiated or not self._tko_reached:
             return
-            
+
         current_time = self.get_clock().now().nanoseconds / 1e9
-        
-        # Check 120-second timer after takeoff
+
         if self._takeoff_complete_time is not None:
             elapsed_since_takeoff = current_time - self._takeoff_complete_time
             if elapsed_since_takeoff >= 120.0:
                 self.get_logger().warn('120 seconds elapsed since takeoff - Initiating RTL')
                 self._initiate_rtl('120-second timer expired')
                 return
-        
-        # Check boundary conditions (30x30m square)
+
         x = self.pose.pose.position.x
         y = self.pose.pose.position.y
-        
         if abs(x) > self.boundary_limit or abs(y) > self.boundary_limit:
-            self.get_logger().warn(f'Boundary violation: position ({x:.1f}, {y:.1f}) - Initiating RTL')
+            self.get_logger().warn(
+                f'Boundary violation: position ({x:.1f}, {y:.1f}) - Initiating RTL'
+            )
             self._initiate_rtl(f'boundary violation at ({x:.1f}, {y:.1f})')
-            return
 
     def _initiate_rtl(self, reason):
-        """Initiate return to land mode and disable tracking"""
         if self._rtl_initiated:
             return
-            
+
         self._rtl_initiated = True
         self._tracking_enabled = False
-        
         self.get_logger().warn(f'SAFETY: Initiating RTL due to {reason}')
-        
+
         if not self.set_mode_client.wait_for_service(timeout_sec=1.0):
             self.get_logger().error('SetMode service not available for RTL!')
             return
-            
+
         req = SetMode.Request()
         req.custom_mode = 'RTL'
         fut = self.set_mode_client.call_async(req)
         fut.add_done_callback(lambda f: self._on_rtl_done(f, reason))
 
     def _on_rtl_done(self, fut, reason):
-        """Handle RTL mode change response"""
         try:
             res = fut.result()
         except Exception as e:
@@ -337,116 +396,155 @@ class RelativePositionController(Node):
         else:
             self.get_logger().error(f'RTL command rejected by FCU (reason: {reason})')
 
+    def _wrap_to_pi(self, angle: float) -> float:
+        while angle > math.pi:
+            angle -= 2.0 * math.pi
+        while angle < -math.pi:
+            angle += 2.0 * math.pi
+        return angle
+
+    def _clamp(self, value: float, limit: float) -> float:
+        return max(min(value, limit), -limit)
+
+    def _clamp_integral(self, value: float, limit: float) -> float:
+        return max(min(value, limit), -limit)
+
+    def _body_to_world(self, x_body: float, y_body: float, heading: float):
+        c = math.cos(heading)
+        s = math.sin(heading)
+        x_world = c * x_body - s * y_body
+        y_world = s * x_body + c * y_body
+        return x_world, y_world
+
+    def _update_relative_target(self):
+        # Stage 1: do nothing until tracking is enabled
+        if not self._tracking_enabled:
+            return
+
+        t = self.get_clock().now().nanoseconds / 1e9
+        radius = 1.5
+        omega = 0.2
+
+        self.rel_x_body = 2.0
+        self.rel_y_body = 3.0 + 2.0 * math.sin(0.4 * t)
+        self.rel_z_body = 3.0
 
     def _publish_setpoint(self):
-
-        # Don't send position commands if RTL has been initiated
-        if self._rtl_initiated:
-            current_time = self.get_clock().now().nanoseconds / 1e9
-            self.csv_writer.writerow([
-                current_time,
-                self.pose.pose.position.x,
-                self.pose.pose.position.y,
-                self.pose.pose.position.z,
-                self.target_x,
-                self.target_y,
-                self.target_z,
-                self.pose.pose.position.x,
-                self.pose.pose.position.y,
-                self.pose.pose.position.z,
-                self.target_heading,
-                0.0,
-            ])
-            self.csv_file.flush()
-            return
-
-        # Before takeoff is complete, hold current XY and command takeoff altitude only
-        if not self._tko_reached:
-            msg = PoseStamped()
-            msg.header.stamp = self.get_clock().now().to_msg()
-            msg.header.frame_id = 'map'
-
-            msg.pose.position.x = self.pose.pose.position.x
-            msg.pose.position.y = self.pose.pose.position.y
-            msg.pose.position.z = self.target_altitude
-
-            msg.pose.orientation.x = 0.0
-            msg.pose.orientation.y = 0.0
-            msg.pose.orientation.z = 0.0
-            msg.pose.orientation.w = 1.0
-
-            self.pos_pub.publish(msg)
-
-            current_time = self.get_clock().now().nanoseconds / 1e9
-            self.csv_writer.writerow([
-                current_time,
-                self.pose.pose.position.x,
-                self.pose.pose.position.y,
-                self.pose.pose.position.z,
-                self.target_x,
-                self.target_y,
-                self.target_z,
-                msg.pose.position.x,
-                msg.pose.position.y,
-                msg.pose.position.z,
-                self.target_heading,
-                0.0,
-            ])
-            self.csv_file.flush()
-            return
-
-        psi = self.target_heading + self.azimuth_offset
-        r_xy = self.range_r * math.cos(self.elevation_offset)
-        dz = self.range_r * math.sin(self.elevation_offset)
-
-        dx = r_xy * math.cos(psi)
-        dy = r_xy * math.sin(psi)
-
-        desired_x = self.target_x + dx
-        desired_y = self.target_y + dy
-        desired_z = self.target_z + dz
-
-        desired_yaw = math.atan2(self.target_y - desired_y, self.target_x - desired_x)
-
-        msg = PoseStamped()
+        msg = TwistStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = 'map'
 
-        msg.pose.position.x = desired_x
-        msg.pose.position.y = desired_y
-        msg.pose.position.z = desired_z
+        if self._rtl_initiated:
+            return
 
-        msg.pose.orientation.x = 0.0
-        msg.pose.orientation.y = 0.0
-        msg.pose.orientation.z = math.sin(desired_yaw / 2.0)
-        msg.pose.orientation.w = math.cos(desired_yaw / 2.0)
+        current_x = self.pose.pose.position.x
+        current_y = self.pose.pose.position.y
+        current_z = self.pose.pose.position.z
 
-        self.pos_pub.publish(msg)
+        # Stage 1: do NOT publish cmd_vel during startup/takeoff/hover
+        if not self._tracking_enabled:
+            current_time = self.get_clock().now().nanoseconds / 1e9
+            self.csv_writer.writerow([
+                current_time,
+                'stage1',
+                current_x, current_y, current_z,
+                self.target_x, self.target_y, self.target_z,
+                current_x, current_y, current_z,
+                0.0, 0.0, 0.0, 0.0,
+                0.0, 0.0, 0.0, 0.0
+            ])
+            self.csv_file.flush()
+            return
+
+        # Stage 2: relative PID tracking
+        rel_x_world, rel_y_world = self._body_to_world(
+            self.rel_x_body, self.rel_y_body, self.target_heading
+        )
+
+        desired_x = self.target_x + rel_x_world
+        desired_y = self.target_y + rel_y_world
+        desired_z = self.target_z + self.rel_z_body
+
+        ex = desired_x - current_x
+        ey = desired_y - current_y
+        ez = desired_z - current_z
+
+        desired_yaw = math.atan2(self.target_y - current_y, self.target_x - current_x)
+        desired_yaw = self._wrap_to_pi(desired_yaw)
+        current_yaw = self._get_current_yaw_from_pose()
+        eyaw = self._wrap_to_pi(desired_yaw - current_yaw)
+
+        self.int_ex = self._clamp_integral(self.int_ex + ex * self.dt, self.max_integral_xy)
+        self.int_ey = self._clamp_integral(self.int_ey + ey * self.dt, self.max_integral_xy)
+        self.int_ez = self._clamp_integral(self.int_ez + ez * self.dt, self.max_integral_z)
+        self.int_eyaw = self._clamp_integral(self.int_eyaw + eyaw * self.dt, self.max_integral_yaw)
+
+        dex = (ex - self.prev_ex) / self.dt
+        dey = (ey - self.prev_ey) / self.dt
+        dez = (ez - self.prev_ez) / self.dt
+        deyaw = (eyaw - self.prev_eyaw) / self.dt
+
+        vx = self.kp_x * ex + self.ki_x * self.int_ex + self.kd_x * dex
+        vy = self.kp_y * ey + self.ki_y * self.int_ey + self.kd_y * dey
+        vz = self.kp_z * ez + self.ki_z * self.int_ez + self.kd_z * dez
+        yaw_rate = self.kp_yaw * eyaw + self.ki_yaw * self.int_eyaw + self.kd_yaw * deyaw
+
+        vx = self._clamp(vx, self.max_vel_xy)
+        vy = self._clamp(vy, self.max_vel_xy)
+        vz = self._clamp(vz, self.max_vel_z)
+        yaw_rate = self._clamp(yaw_rate, self.max_yaw_rate)
+
+        self.prev_ex = ex
+        self.prev_ey = ey
+        self.prev_ez = ez
+        self.prev_eyaw = eyaw
+
+        msg.twist.linear.x = vx
+        msg.twist.linear.y = vy
+        msg.twist.linear.z = vz
+        msg.twist.angular.z = yaw_rate
+        self.vel_pub.publish(msg)
 
         current_time = self.get_clock().now().nanoseconds / 1e9
         self.csv_writer.writerow([
             current_time,
-            self.pose.pose.position.x,
-            self.pose.pose.position.y,
-            self.pose.pose.position.z,
-            self.target_x,
-            self.target_y,
-            self.target_z,
-            desired_x,
-            desired_y,
-            desired_z,
-            self.target_heading,
-            desired_yaw,
+            'stage2',
+            current_x, current_y, current_z,
+            self.target_x, self.target_y, self.target_z,
+            desired_x, desired_y, desired_z,
+            ex, ey, ez, eyaw,
+            vx, vy, vz, yaw_rate
         ])
         self.csv_file.flush()
 
-
     def destroy_node(self):
-        """Clean up CSV file when node is destroyed"""
         if hasattr(self, 'csv_file'):
             self.csv_file.close()
             self.get_logger().info(f'CSV file closed: {self.csv_filename}')
         super().destroy_node()
+
+    def _get_current_yaw_from_pose(self):
+        q = self.pose.pose.orientation
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        return math.atan2(siny_cosp, cosy_cosp)
+    
+    def _on_target_pose(self, msg):
+        for transform in msg.transforms:
+            
+            if transform.child_frame_id == "person_1":
+                self.target_x = transform.transform.translation.x
+                self.target_y = transform.transform.translation.y
+                self.target_z = transform.transform.translation.z
+                self.get_logger().info(
+                    f"Target pose → x: {self.target_x:.2f}, y: {self.target_y:.2f}, z: {self.target_z:.2f}"
+                )
+                return
+           
+    def _update_fake_target_pose(self):
+        t = self.get_clock().now().nanoseconds / 1e9
+        self.target_x = 2.0 * math.cos(0.15 * t)
+        self.target_y = 5.0 + 2.0 * math.sin(0.15 * t)
+        self.target_z = 0.0
 
 
 def main(args=None):
