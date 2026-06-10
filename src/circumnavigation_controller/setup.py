@@ -26,7 +26,9 @@ setup(
         'console_scripts': [
             'bearing_measurement_generation = circumnavigation_controller.bearing_measurement_generation:main',
             'controller = circumnavigation_controller.controller:main',
-            'relative_position_controller = circumnavigation_controller.relative_position_controller:main'
+            'relative_position_controller = circumnavigation_controller.relative_position_controller:main',
+            'camera_calibrate = circumnavigation_controller.camera_calibrate:main',
+            'aruco_detector = circumnavigation_controller.aruco_detector:main'
         ],
     },
 )

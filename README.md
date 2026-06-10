@@ -66,6 +66,9 @@ Each application will need to be run in separate terminal windows.
 export GZ_SIM_SYSTEM_PLUGIN_PATH=$HOME/{PATH_TO_INSTALL}/ardupilot_gazebo/build:$GZ_SIM_SYSTEM_PLUGIN_PATH
 cd worlds
 gz sim iris_runway.sdf -v -r
+
+gz sim iris_runway_new.sdf -v -r
+
 ```
 
 ### Run Gazebo Camera Bridge
@@ -74,10 +77,28 @@ gz sim iris_runway.sdf -v -r
 ros2 run ros_gz_bridge parameter_bridge /world/iris_runway/model/iris_with_gimbal/link/camera_link/sensor/camera/image@sensor_msgs/msg/Image@gz.msgs.Image --ros-args -r /world/iris_runway/model/iris_with_gimbal/link/camera_link/sensor/camera/image:=/camera/image_raw
 ```
 
+
+```bash
+ros2 run ros_gz_bridge parameter_bridge /world/iris_runway/model/iris_with_gimbal/link/camera_link/sensor/camera/image@sensor_msgs/msg/Image@gz.msgs.Image --ros-args -r /world/iris_runway/model/iris_with_gimbal/link/camera_link/sensor/camera/image:=/camera/image_raw
+```
+
+Final bridge
+```bash
+ros2 run ros_gz_bridge parameter_bridge \
+/world/iris_runway_new/model/iris_with_gimbal/model/gimbal/link/tilt_link/sensor/camera/image@sensor_msgs/msg/Image[gz.msgs.Image \
+/model/LandingVehicle/odometry@nav_msgs/msg/Odometry[gz.msgs.Odometry \
+/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock \
+--ros-args \
+-r /world/iris_runway_new/model/iris_with_gimbal/model/gimbal/link/tilt_link/sensor/camera/image:=/camera/image_raw \
+-r /model/LandingVehicle/odometry:=/landing_pad/odom
+```
+
 ### Run ArduPilot
 
 ```bash
-cd ~/Documents/PhD/ardupilot && sim_vehicle.py -v ArduCopter --console --map -w --out=udp:127.0.0.1:14555 -f gazebo-iris --model JSON
+cd ~/ardupilot && sim_vehicle.py -v ArduCopter --console --map -w --out=udp:127.0.0.1:14555 -f gazebo-iris --model JSON
+
+cd ~/ardupilot && sim_vehicle.py -v ArduCopter --console --map --out=udp:127.0.0.1:14555 -f gazebo-iris --model JSON
 ```
 
 ### Run MAVROS

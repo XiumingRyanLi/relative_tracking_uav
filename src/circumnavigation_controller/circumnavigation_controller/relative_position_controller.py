@@ -6,14 +6,17 @@ from datetime import datetime
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from rclpy.executors import MultiThreadedExecutor
+from rclpy.time import Time
 
-from std_msgs.msg import Float64
+from std_msgs.msg import Float64, Bool
 from geometry_msgs.msg import PoseStamped, TwistStamped
 from sensor_msgs.msg import NavSatFix
 from mavros_msgs.msg import State
 from mavros_msgs.srv import CommandBool, CommandTOL, SetMode, MessageInterval
+from nav_msgs.msg import Odometry
 
-from tf2_msgs.msg import TFMessage
+import tf2_ros
+import tf_transformations
 
 class RelativePositionController(Node):
     def __init__(self):
@@ -32,6 +35,10 @@ class RelativePositionController(Node):
             depth=10
         )
 
+
+        # ------------------------------------------------------------------
+        # MAVROS subscribers
+        # ------------------------------------------------------------------
         self.state_sub = self.create_subscription(
             State, '/mavros/state', self._on_state, state_qos
         )
@@ -45,27 +52,47 @@ class RelativePositionController(Node):
             Float64, '/mavros/global_position/compass_hdg', self._on_compass, pose_qos
         )
 
+        # ---------------------------------------------------------
+        # ArUco target state
+        # ---------------------------------------------------------
+        self.aruco_found = False
+        self.target_pose_received = False
+
+        self.last_target_update_time = None
+        self.target_timeout_sec = 0.8
+
+        self.aruco_found_sub = self.create_subscription(
+            Bool,
+            '/aruco_target/found',
+            self._on_aruco_found,
+            10
+        )
+
+        self.aruco_odom_sub = self.create_subscription(
+            Odometry,
+            '/aruco_target/odom',
+            self._on_aruco_odom,
+            10
+        )
+
+        # ------------------------------------------------------------------
+        # Publisher
+        # ------------------------------------------------------------------
         self.vel_pub = self.create_publisher(
             TwistStamped, '/mavros/setpoint_velocity/cmd_vel', 10
         )
 
+        # ------------------------------------------------------------------
+        # Timers
+        # ------------------------------------------------------------------
         self.setpoint_timer = self.create_timer(0.15, self._publish_setpoint)
         self.rel_update_timer = self.create_timer(0.5, self._update_relative_target)
+        self.orchestrator = self.create_timer(0.2, self._orchestrate)
+        self.safety_timer = self.create_timer(1.0, self._check_safety_conditions)
 
-        # Useless now
-        self.target_pose_sub = self.create_subscription(
-            TFMessage,
-            '/world/iris_runway/dynamic_pose/info',
-            self._on_target_pose,
-            10
-        )
-
-        self.fake_target_timer = self.create_timer(0.1, self._update_fake_target_pose)
-
-
-
-
-
+        # ------------------------------------------------------------------
+        # MAVROS service clients
+        # ------------------------------------------------------------------
         self.set_mode_client = self.create_client(SetMode, '/mavros/set_mode')
         self.arming_client = self.create_client(CommandBool, '/mavros/cmd/arming')
         self.takeoff_client = self.create_client(CommandTOL, '/mavros/cmd/takeoff')
@@ -73,6 +100,8 @@ class RelativePositionController(Node):
             MessageInterval, '/mavros/set_message_interval'
         )
 
+
+        
         self.state = State()
         self.pose = PoseStamped()
         self.global_pos = NavSatFix()
@@ -85,7 +114,7 @@ class RelativePositionController(Node):
         self.target_x = 0.0
         self.target_y = 5.0
         self.target_z = 0.0
-        self.target_heading = math.pi / 2.0  # north in ENU assumption
+        self.target_heading = 0.0  # updated from /aruco_target/odom orientation
 
         # Relative coordinate in target body frame
         self.rel_x_body = -4.0
@@ -455,6 +484,25 @@ class RelativePositionController(Node):
             self.csv_file.flush()
             return
 
+        # If tracking is enabled but ArUco target is not available, hold position by sending zero velocity.
+        if not self.aruco_found or not self.target_pose_received:
+            msg.twist.linear.x = 0.0
+            msg.twist.linear.y = 0.0
+            msg.twist.linear.z = 0.0
+            msg.twist.angular.z = 0.0
+            self.vel_pub.publish(msg)
+            return
+
+        if self.last_target_update_time is not None:
+            now = self.get_clock().now().nanoseconds / 1e9
+            if (now - self.last_target_update_time) > self.target_timeout_sec:
+                msg.twist.linear.x = 0.0
+                msg.twist.linear.y = 0.0
+                msg.twist.linear.z = 0.0
+                msg.twist.angular.z = 0.0
+                self.vel_pub.publish(msg)
+                return
+
         # Stage 2: relative PID tracking
         rel_x_world, rel_y_world = self._body_to_world(
             self.rel_x_body, self.rel_y_body, self.target_heading
@@ -516,11 +564,7 @@ class RelativePositionController(Node):
         ])
         self.csv_file.flush()
 
-    def destroy_node(self):
-        if hasattr(self, 'csv_file'):
-            self.csv_file.close()
-            self.get_logger().info(f'CSV file closed: {self.csv_filename}')
-        super().destroy_node()
+
 
     def _get_current_yaw_from_pose(self):
         q = self.pose.pose.orientation
@@ -540,11 +584,30 @@ class RelativePositionController(Node):
                 )
                 return
            
-    def _update_fake_target_pose(self):
-        t = self.get_clock().now().nanoseconds / 1e9
-        self.target_x = 2.0 * math.cos(0.15 * t)
-        self.target_y = 5.0 + 2.0 * math.sin(0.15 * t)
-        self.target_z = 0.0
+    def _on_aruco_found(self, msg):
+        self.aruco_found = msg.data
+
+    def _on_aruco_odom(self, msg):
+
+        self.target_x = msg.pose.pose.position.x
+        self.target_y = msg.pose.pose.position.y
+        self.target_z = msg.pose.pose.position.z
+
+        q = msg.pose.pose.orientation
+
+        _, _, self.target_heading = tf_transformations.euler_from_quaternion(
+            [q.x, q.y, q.z, q.w]
+        )
+
+        self.target_pose_received = True
+        self.last_target_update_time = self.get_clock().now().nanoseconds / 1e9
+
+
+    def destroy_node(self):
+        if hasattr(self, 'csv_file'):
+            self.csv_file.close()
+            self.get_logger().info(f'CSV file closed: {self.csv_filename}')
+        super().destroy_node()
 
 
 def main(args=None):
