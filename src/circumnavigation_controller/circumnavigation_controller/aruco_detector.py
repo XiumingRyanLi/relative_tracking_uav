@@ -6,6 +6,8 @@ from datetime import datetime
 
 import cv2
 import numpy as np
+if not hasattr(np, "float"):
+    np.float = float
 from cv_bridge import CvBridge
 import tf2_ros
 import tf_transformations
@@ -54,7 +56,7 @@ class ArUCoNode(Node):
         )
 
         # SHow the camera viewport
-        self.declare_parameter("show_debug_window", False)
+        self.declare_parameter("show_debug_window", True)
         self.show_debug_window = (
             self.get_parameter("show_debug_window").get_parameter_value().bool_value
         )
@@ -136,7 +138,8 @@ class ArUCoNode(Node):
         self._bridge = CvBridge()
         self._webcam_publisher = self.create_publisher(Image, "/image", 10)
         self._aruco_target_found_publisher = self.create_publisher(Bool, "/aruco_target/found", 10)
-        self._aruco_target_odom_publisher = self.create_publisher(Odometry, "/aruco_target/odom", 10)
+        self._aruco_target_odom_publisher = self.create_publisher(Odometry, "/aruco_target/visual_odom", 10)
+        self.debug_image_pub = self.create_publisher(Image, "/aruco_detector/image", 10)
 
         # ---- TF2 ----
         self._tf_cam_to_tag_broadcaster = tf2_ros.TransformBroadcaster(self)
@@ -144,12 +147,12 @@ class ArUCoNode(Node):
 
         # ---- OPENCV ----
         self._aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_5X5_50)
-        self._aruco_params = cv2.aruco.DetectorParameters_create()
+        self._aruco_params = cv2.aruco.DetectorParameters()
         # self.aruco_params.adaptiveThreshWinSizeMin = 3
         # self.aruco_params.adaptiveThreshWinSizeMax = 23
         # self.aruco_params.adaptiveThreshWinSizeStep = 10
         self._aruco_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
-        self.detector = None
+        self.detector = cv2.aruco.ArucoDetector(self._aruco_dict, self._aruco_params)
 
         # ---- INITIALISATION ----
         self.frame_count = 0
@@ -263,11 +266,7 @@ class ArUCoNode(Node):
 
         # Inference (ArUCo detection via OpenCV)
         gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) # Change to greyscale before inference step
-        corners, ids, _ = cv2.aruco.detectMarkers(
-            gray_frame,
-            self._aruco_dict,
-            parameters=self._aruco_params
-        )
+        corners, ids, _ = self.detector.detectMarkers(gray_frame)
 
         # Check whether a recognised target tag is visible.
         aruco_target_found = False
@@ -297,6 +296,8 @@ class ArUCoNode(Node):
                 self._dist_coeffs,
                 flags=cv2.SOLVEPNP_IPPE_SQUARE
             )
+
+            self.get_logger().info(f"ArUCo tag {tag_id} detected. rvec: {rvec.flatten()}, tvec: {tvec.flatten()}")
 
             if success:
                 # Draw pose axes for debugging

@@ -77,28 +77,45 @@ gz sim iris_runway_new.sdf -v -r
 ros2 run ros_gz_bridge parameter_bridge /world/iris_runway/model/iris_with_gimbal/link/camera_link/sensor/camera/image@sensor_msgs/msg/Image@gz.msgs.Image --ros-args -r /world/iris_runway/model/iris_with_gimbal/link/camera_link/sensor/camera/image:=/camera/image_raw
 ```
 
-
-```bash
-ros2 run ros_gz_bridge parameter_bridge /world/iris_runway/model/iris_with_gimbal/link/camera_link/sensor/camera/image@sensor_msgs/msg/Image@gz.msgs.Image --ros-args -r /world/iris_runway/model/iris_with_gimbal/link/camera_link/sensor/camera/image:=/camera/image_raw
-```
-
 Final bridge
 ```bash
 ros2 run ros_gz_bridge parameter_bridge \
-/world/iris_runway_new/model/iris_with_gimbal/model/gimbal/link/tilt_link/sensor/camera/image@sensor_msgs/msg/Image[gz.msgs.Image \
+/world/iris_runway_new/model/iris_with_gimbal/model/gimbal/link/pitch_link/sensor/camera/image@sensor_msgs/msg/Image[gz.msgs.Image \
 /model/LandingVehicle/odometry@nav_msgs/msg/Odometry[gz.msgs.Odometry \
 /clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock \
+/gimbal/cmd_roll@std_msgs/msg/Float64]gz.msgs.Double \
+/gimbal/cmd_pitch@std_msgs/msg/Float64]gz.msgs.Double \
+/gimbal/cmd_yaw@std_msgs/msg/Float64]gz.msgs.Double \
 --ros-args \
--r /world/iris_runway_new/model/iris_with_gimbal/model/gimbal/link/tilt_link/sensor/camera/image:=/camera/image_raw \
--r /model/LandingVehicle/odometry:=/landing_pad/odom
+-r /world/iris_runway_new/model/iris_with_gimbal/model/gimbal/link/pitch_link/sensor/camera/image:=/camera/image_raw \
+-r /model/LandingVehicle/odometry:=/aruco_target/odom
 ```
+
+```bash
+ros2 run ros_gz_bridge parameter_bridge \
+"/world/iris_runway_new/model/iris_with_gimbal/model/gimbal/link/pitch_link/sensor/camera/image@sensor_msgs/msg/Image[gz.msgs.Image" \
+"/model/LandingVehicle/odometry@nav_msgs/msg/Odometry[gz.msgs.Odometry" \
+"/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock" \
+"/gimbal/cmd_roll@std_msgs/msg/Float64]gz.msgs.Double" \
+"/gimbal/cmd_pitch@std_msgs/msg/Float64]gz.msgs.Double" \
+"/gimbal/cmd_yaw@std_msgs/msg/Float64]gz.msgs.Double" \
+"/world/iris_runway_new/model/iris_with_gimbal/joint_state@sensor_msgs/msg/JointState[gz.msgs.Model" \
+--ros-args \
+-r /world/iris_runway_new/model/iris_with_gimbal/model/gimbal/link/pitch_link/sensor/camera/image:=/camera/image_raw \
+-r /model/LandingVehicle/odometry:=/aruco_target/odom \
+-r /world/iris_runway_new/model/iris_with_gimbal/joint_state:=/gimbal/joint_states
+```
+
 
 ### Run ArduPilot
 
 ```bash
 cd ~/ardupilot && sim_vehicle.py -v ArduCopter --console --map -w --out=udp:127.0.0.1:14555 -f gazebo-iris --model JSON
 
-cd ~/ardupilot && sim_vehicle.py -v ArduCopter --console --map --out=udp:127.0.0.1:14555 -f gazebo-iris --model JSON
+cd ~/ardupilot && sim_vehicle.py -D -v ArduCopter -f JSON \
+--add-param-file=$HOME/ardupilot_gazebo/config/gazebo-iris-gimbal.parm \
+--console --map \
+--out=udp:127.0.0.1:14555
 ```
 
 ### Run MAVROS
@@ -121,4 +138,10 @@ source install/setup.bash
 ros2 run circumnavigation_controller controller
 
 ros2 run circumnavigation_controller relative_position_controller
+```
+
+### Controlling the Rover
+```bash
+gz topic -t "/cmd_rover_vel" -m gz.msgs.Twist -p "linear: {x: 0.6}, angular: {z: 1.0}"
+
 ```

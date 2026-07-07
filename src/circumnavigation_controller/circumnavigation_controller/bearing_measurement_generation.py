@@ -21,6 +21,13 @@ from cv_bridge import CvBridge
 import cv2
 
 import numpy as np
+
+if not hasattr(np, "float"):
+    np.float = float
+
+import tf_transformations
+
+
 import tf_transformations
 import logging
 import warnings
@@ -386,7 +393,7 @@ class YoloImageNode(Node):
             self.get_logger().info(f"Video dimensions: {width}x{height}")
             
             # Define codec and create VideoWriter
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            fourcc = cv2.VideoWriter.fourcc(*'mp4v')
             video_writer = cv2.VideoWriter(
                 self.video_filename, 
                 fourcc, 
