@@ -111,6 +111,16 @@ class ArUCoNode(Node):
 
         self._dist_coeffs = np.array([0, 0, 0, 0, 0], dtype=np.float64)
 
+        # Frame used by the visual odometry output. This should match the
+        # camera/OpenCV frame assumed by the controller.
+        self.declare_parameter("camera_frame", "camera_link")
+        self.camera_frame = self.get_parameter("camera_frame").value
+
+        # Reject very small detections before pose estimation. Long-range
+        # tiny markers give unstable rvec/yaw even when tvec is usable.
+        self.declare_parameter("min_marker_area_px", 50.0)
+        self.min_marker_area_px = float(self.get_parameter("min_marker_area_px").value)
+
         # ---- TAG PARAMETERS ----
         self._TAG_SIZES = {
                 35: 0.455,
@@ -268,23 +278,29 @@ class ArUCoNode(Node):
         gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) # Change to greyscale before inference step
         corners, ids, _ = self.detector.detectMarkers(gray_frame)
 
-        # Check whether a recognised target tag is visible.
-        aruco_target_found = False
+        # Keep only recognised markers and choose the largest recognised one.
+        # Previously, the code first checked that *some* recognised marker existed,
+        # then selected the largest marker from all detections. If an unknown marker
+        # was larger, object_points[tag_id] could fail or produce the wrong pose.
+        valid_markers = []
         if ids is not None:
-            for tag_id_arr in ids:
+            for i, tag_id_arr in enumerate(ids):
                 tag_id = int(tag_id_arr[0])
-                if tag_id in self._object_points:
-                    aruco_target_found = True
-                    break
+                if tag_id not in self._object_points:
+                    continue
 
+                area = cv2.contourArea(corners[i][0].astype(np.float32))
+                if area < self.min_marker_area_px:
+                    continue
+
+                valid_markers.append((area, i, tag_id))
+
+        aruco_target_found = len(valid_markers) > 0
         self._aruco_target_found_publisher.publish(Bool(data=aruco_target_found))
 
-        # If tag is recognised, then execute pose calculations
-        if aruco_target_found == True:
-            # Compute areas
-            areas = [cv2.contourArea(c[0].astype(np.float32)) for c in corners]
-            idx = int(np.argmax(areas))      # index of largest detected marker
-            tag_id = int(ids[idx][0])
+        # If a recognised tag is visible, execute pose calculations.
+        if aruco_target_found:
+            area, idx, tag_id = max(valid_markers, key=lambda item: item[0])
 
             image_points = corners[idx][0].astype(np.float32)
             object_points = self._object_points[tag_id]
@@ -297,7 +313,11 @@ class ArUCoNode(Node):
                 flags=cv2.SOLVEPNP_IPPE_SQUARE
             )
 
-            self.get_logger().info(f"ArUCo tag {tag_id} detected. rvec: {rvec.flatten()}, tvec: {tvec.flatten()}")
+            self.get_logger().info(
+                f"ArUCo tag {tag_id} detected. area={area:.1f}, "
+                f"rvec={rvec.flatten()}, tvec={tvec.flatten()}",
+                throttle_duration_sec=0.5,
+            )
 
             if success:
                 # Draw pose axes for debugging
@@ -311,7 +331,7 @@ class ArUCoNode(Node):
                         self._TAG_SIZES[tag_id] * 0.5
                     )
 
-                # Broadcast aruco_target position relative to camera frame
+                # Broadcast target position relative to the camera frame.
                 cam_to_tag_tf_msg = self.cam_to_tag_transformstamped(stamp, tag_id, rvec, tvec)
                 tag_to_aruco_target_tf_msg = self.tag_to_aruco_target_transformstamped(stamp, tag_id, self._TAG_POSITIONS)
                 if cam_to_tag_tf_msg is not None and tag_to_aruco_target_tf_msg is not None:
@@ -321,6 +341,14 @@ class ArUCoNode(Node):
                     aruco_target_odom_msg = self.aruco_target_odometry(stamp, tag_id, rvec, tvec, self._TAG_POSITIONS)
                     if aruco_target_odom_msg is not None:
                         self._aruco_target_odom_publisher.publish(aruco_target_odom_msg)
+
+                        p = aruco_target_odom_msg.pose.pose.position
+                        target_distance = float(np.sqrt(p.x * p.x + p.y * p.y + p.z * p.z))
+                        self.get_logger().info(
+                            f"ArUco target distance={target_distance:.2f} m, "
+                            f"camera_position=({p.x:.2f}, {p.y:.2f}, {p.z:.2f})",
+                            throttle_duration_sec=0.5,
+                        )
 
         # Show the output image after ArUCo detection (if debug window enabled)
         if self.show_debug_window:
@@ -366,7 +394,7 @@ class ArUCoNode(Node):
         # Header for pose
         tf_cam_to_tag = TransformStamped()
         tf_cam_to_tag.header.stamp = stamp
-        tf_cam_to_tag.header.frame_id = "camera_link"
+        tf_cam_to_tag.header.frame_id = self.camera_frame
         tf_cam_to_tag.child_frame_id = f"tag{tag_id}_link" # keeps tag_id positions in sync with cam detection
         tf_cam_to_tag.transform.translation.x = t_cam_to_tag[0]
         tf_cam_to_tag.transform.translation.y = t_cam_to_tag[1]
@@ -400,13 +428,13 @@ class ArUCoNode(Node):
     
     def aruco_target_odometry(self, stamp, tag_id, rvec, tvec, tag_positions):
         """
-        Publish the final aruco_target_link pose relative to camera_link as Odometry.
+        Publish the final aruco_target_link pose relative to self.camera_frame as Odometry.
 
         This composes:
-            camera_link -> tag<ID>_link
+            camera frame -> tag<ID>_link
             tag<ID>_link -> aruco_target_link
 
-        The resulting /aruco_target/odom message is therefore in the camera_link frame.
+        The resulting visual odometry message is therefore in self.camera_frame.
         The controller can either:
           1. use this directly for image-relative control, or
           2. transform it into map/local frame before doing world-frame PID.
@@ -444,7 +472,7 @@ class ArUCoNode(Node):
 
         odom = Odometry()
         odom.header.stamp = stamp
-        odom.header.frame_id = "camera_link"
+        odom.header.frame_id = self.camera_frame
         odom.child_frame_id = "aruco_target_link"
 
         odom.pose.pose.position.x = float(t_cam_to_aruco_target[0])

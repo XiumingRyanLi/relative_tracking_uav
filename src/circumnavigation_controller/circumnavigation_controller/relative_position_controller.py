@@ -3,7 +3,11 @@ import math
 import csv
 from datetime import datetime
 
-from geometry_msgs import msg
+try:
+    from .cinematic_planner import CinematicPlanner
+except ImportError:
+    from cinematic_planner import CinematicPlanner
+    
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
@@ -13,9 +17,7 @@ from geometry_msgs.msg import PoseStamped, TwistStamped
 from nav_msgs.msg import Odometry
 from mavros_msgs.msg import State
 from mavros_msgs.srv import CommandBool, CommandTOL, SetMode
-from std_msgs.msg import Float64
-import tf2_ros
-
+from std_msgs.msg import Float64, Bool
 try:
     from .pid_controller import PIDRelativeController
     from .gimbal_controller import GimbalController
@@ -63,7 +65,7 @@ class RelativePositionController(Node):
         self.declare_parameter("rel_x_body", -2.0)
         self.declare_parameter("rel_y_body", 0.0)
         self.declare_parameter("rel_z_body", 3.0)
-        self.declare_parameter("target_timeout_sec", 1.0)
+        self.declare_parameter("target_timeout_sec", 5.0)
         self.declare_parameter("hover_delay_sec", 4.0)
         self.declare_parameter("boundary_limit", 40.0)
 
@@ -76,19 +78,121 @@ class RelativePositionController(Node):
         self.hover_delay_sec = float(self.get_parameter("hover_delay_sec").value)
         self.boundary_limit = float(self.get_parameter("boundary_limit").value)
 
-        # Get the gimbal frame parameters
-        self.tf_buffer = tf2_ros.Buffer()
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        # Gimbal/camera calibration. MAVROS gimbal feedback gives the
+        # base_link_frd -> gimbal attitude. This fixed transform maps the
+        # gimbal frame into the camera/OpenCV frame used by the ArUCo detector.
+        self.declare_parameter("gimbal_camera_roll_deg", 0.0)
+        self.declare_parameter("gimbal_camera_pitch_deg", 0.0)
+        self.declare_parameter("gimbal_camera_yaw_deg", 0.0)
+        self.T_gimbal_camera = tf_transformations.euler_matrix(
+            math.radians(float(self.get_parameter("gimbal_camera_roll_deg").value)),
+            math.radians(float(self.get_parameter("gimbal_camera_pitch_deg").value)),
+            math.radians(float(self.get_parameter("gimbal_camera_yaw_deg").value)),
+            axes="sxyz",
+        )
 
+        # Visual-heading filtering. ArUCo orientation is noisy at long range,
+        # so update target heading only when the visual estimate is plausible.
+        self.declare_parameter("visual_heading_alpha", 0.25)
+        self.declare_parameter("max_visual_heading_jump_deg", 60.0)
+        self.declare_parameter("max_visual_heading_distance", 5.0)
+        self.declare_parameter("enable_visual_heading_filter", True)
+        self.visual_heading_alpha = float(self.get_parameter("visual_heading_alpha").value)
+        self.max_visual_heading_jump = math.radians(
+            float(self.get_parameter("max_visual_heading_jump_deg").value)
+        )
+        self.max_visual_heading_distance = float(
+            self.get_parameter("max_visual_heading_distance").value
+        )
+        self.enable_visual_heading_filter = bool(
+            self.get_parameter("enable_visual_heading_filter").value
+        )
+        self.visual_heading_valid = False
+        self.filtered_target_heading = 0.0
+
+        # Vision-only target position. /aruco_target/visual_odom contains the
+        # camera-frame target position from solvePnP/tvec. When enabled, the
+        # controller transforms that position into the MAVROS local/world frame
+        # and uses it as target_x/y/z. External target odom can still be kept as
+        # ground truth for debugging.
+        self.declare_parameter("use_visual_target_position", True)
+        self.declare_parameter("use_external_target_position", False)
+        self.declare_parameter("enable_visual_position_filter", True)
+        self.declare_parameter("visual_position_alpha", 0.45)
+        self.declare_parameter("max_visual_position_jump", 3.0)
+        self.declare_parameter("min_visual_target_distance", 0.20)
+        self.use_visual_target_position = bool(
+            self.get_parameter("use_visual_target_position").value
+        )
+        self.use_external_target_position = bool(
+            self.get_parameter("use_external_target_position").value
+        )
+        self.enable_visual_position_filter = bool(
+            self.get_parameter("enable_visual_position_filter").value
+        )
+        self.visual_position_alpha = float(
+            self.get_parameter("visual_position_alpha").value
+        )
+        self.max_visual_position_jump = float(
+            self.get_parameter("max_visual_position_jump").value
+        )
+        self.min_visual_target_distance = float(
+            self.get_parameter("min_visual_target_distance").value
+        )
+        self.visual_position_valid = False
+        self.filtered_target_position = np.zeros(3, dtype=float)
+
+        # Search/acquisition behaviour. Before a visual target is received,
+        # do not hold at the initial zero target. Instead, slowly explore and
+        # sweep the gimbal until /aruco_target/visual_odom arrives.
+        self.declare_parameter("enable_search_mode", True)
+        self.declare_parameter("search_forward_speed", 0.25)
+        self.declare_parameter("search_yaw_rate_deg", 10.0)
+        self.declare_parameter("search_altitude_kp", 0.5)
+        self.declare_parameter("search_max_vertical_speed", 0.4)
+        self.declare_parameter("search_gimbal_pitch_center_deg", -35.0)
+        self.declare_parameter("search_gimbal_pitch_amp_deg", 15.0)
+        self.declare_parameter("search_gimbal_yaw_amp_deg", 75.0)
+        self.declare_parameter("search_gimbal_period_sec", 8.0)
+
+        self.enable_search_mode = bool(self.get_parameter("enable_search_mode").value)
+        self.search_forward_speed = float(self.get_parameter("search_forward_speed").value)
+        self.search_yaw_rate = math.radians(
+            float(self.get_parameter("search_yaw_rate_deg").value)
+        )
+        self.search_altitude_kp = float(self.get_parameter("search_altitude_kp").value)
+        self.search_max_vertical_speed = float(
+            self.get_parameter("search_max_vertical_speed").value
+        )
+        self.search_gimbal_pitch_center = math.radians(
+            float(self.get_parameter("search_gimbal_pitch_center_deg").value)
+        )
+        self.search_gimbal_pitch_amp = math.radians(
+            float(self.get_parameter("search_gimbal_pitch_amp_deg").value)
+        )
+        self.search_gimbal_yaw_amp = math.radians(
+            float(self.get_parameter("search_gimbal_yaw_amp_deg").value)
+        )
+        self.search_gimbal_period_sec = max(
+            1.0, float(self.get_parameter("search_gimbal_period_sec").value)
+        )
         
-        self.declare_parameter("gimbal_base_frame", "base_link_frd")
-        self.declare_parameter("gimbal_frame", "gimbal_0")
 
-        self.gimbal_base_frame = self.get_parameter("gimbal_base_frame").value
-        self.gimbal_frame = self.get_parameter("gimbal_frame").value
+        # Configure gimbal parameters and gimbal controller parameters.
+        # The service expects degrees; GimbalController returns radians.
+        self.declare_parameter("gimbal_device_id", 0)
+        self.declare_parameter("gimbal_command_period_sec", 0.2)
+        self.declare_parameter("gimbal_pitch_sign", -1.0)
+        self.declare_parameter("gimbal_yaw_sign", -1.0)
+        self.gimbal_device_id = int(self.get_parameter("gimbal_device_id").value)
+        self.gimbal_command_period_sec = float(
+            self.get_parameter("gimbal_command_period_sec").value
+        )
+        self.gimbal_pitch_sign = float(self.get_parameter("gimbal_pitch_sign").value)
+        self.gimbal_yaw_sign = float(self.get_parameter("gimbal_yaw_sign").value)
 
-        # Configure gimbal parameters and gimbal controller parameters
         self._gimbal_configured = False
+        self._gimbal_config_in_progress = False
         self._last_gimbal_cmd_time = 0.0
 
         self.current_gimbal_pitch = 0.0
@@ -101,6 +205,14 @@ class RelativePositionController(Node):
         # Gimbal status and orientation
         self.have_gimbal_attitude = False
         self.T_frd_gimbal = np.eye(4)
+        self.gimbal_feedback_flags = 0
+
+        self.T_gimbal_camera = np.eye(4)
+        self.T_gimbal_camera[:3, :3] = np.array([
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ])
 
         # ---------------- Pure controllers ----------------
         self.pid = PIDRelativeController(dt=0.15)
@@ -113,12 +225,16 @@ class RelativePositionController(Node):
         self.pose_sub = self.create_subscription(
             PoseStamped, "/mavros/local_position/pose", self._on_drone_pose, best_effort_qos
         )
-        self.target_odom_sub = self.create_subscription(
-            Odometry, self.target_odom_topic, self._on_target_odom, 10
-        )
+        # self.target_odom_sub = self.create_subscription(
+        #     Odometry, self.target_odom_topic, self._on_target_odom, 10
+        # )
 
         self.visual_odom_sub = self.create_subscription(
             Odometry, "/aruco_target/visual_odom", self._on_visual_odom, 10
+        )
+
+        self.target_found_sub = self.create_subscription(
+            Bool, "/aruco_target/found", self._on_target_found, 10
         )
 
         self.compass_subscription = self.create_subscription(
@@ -169,6 +285,65 @@ class RelativePositionController(Node):
         self.target_received = False
         self.last_target_time = None
 
+        # Latest visual target measurement in camera optical frame
+        self._search_start_time = None
+        self._last_search_log_time = 0.0
+        self._last_target_found_msg = None
+        self.visual_cam_x = 0.0
+        self.visual_cam_y = 0.0
+        self.visual_cam_z = 0.0
+        self.last_visual_camera_time = None
+
+        # ---------------- Cinmatic planner ----------------
+        self.cinematic_planner = CinematicPlanner()
+
+        self.cinematic_planner.set_sequence([
+            # {
+            #     "type": "hold_location",
+            #     "location": "right",
+            #     "radius": 3.0,
+            #     "height": 3.0,
+            #     "duration": 20.0,
+            # },
+            {
+                "type": "move_location",
+                "from": "back",
+                "to": "front",
+                "radius": 3.0,
+                "height": 3.0,
+                "duration": 10.0,
+            },
+            {
+                "type": "overpass",
+                "from": "front",
+                "to": "back",
+                "radius": 3.0,
+                "start_height": 3.0,
+                "peak_height": 3.5,
+                "end_height": 3.0,
+                "duration": 15.0,
+            },
+            {
+                "type": "hold_location",
+                "location": "right",
+                "radius": 3.0,
+                "height": 3.0,
+                "duration": 5.0,
+            },
+            {
+                "type": "move_location",
+                "from": "right",
+                "to": "left",
+                "via": "front",
+                "radius": 3.0,
+                "height": 3.0,
+                "duration": 12.0,
+            },
+
+
+        ]) 
+
+
         # ---------------- Flight sequence flags ----------------
         self._guided_requested = False
         self._guided_confirmed = False
@@ -204,7 +379,10 @@ class RelativePositionController(Node):
         ])
 
         self.get_logger().info(
-            f"RelativePositionController started. Target odom topic: {self.target_odom_topic}"
+            "RelativePositionController started. "
+            f"Vision target source: /aruco_target/visual_odom, "
+            f"external/debug odom topic: {self.target_odom_topic}, "
+            f"search_mode={self.enable_search_mode}"
         )
 
     # ------------------------------------------------------------------
@@ -221,6 +399,37 @@ class RelativePositionController(Node):
 
     def _target_is_fresh(self, now: float) -> bool:
         return self.last_target_time is not None and (now - self.last_target_time) <= self.target_timeout_sec
+
+    def _target_available(self, now: float) -> bool:
+        return self.target_received and self._target_is_fresh(now)
+
+    def _enter_search_mode(self):
+        if self._search_start_time is None:
+            self._search_start_time = self._now()
+            self.pid.reset()
+            self.get_logger().warn(
+                "No visual target available — entering SEARCH mode. "
+                "Drone will move slowly and sweep the gimbal."
+            )
+
+    def _exit_search_mode(self):
+        if self._search_start_time is not None:
+            self._search_start_time = None
+            self.pid.reset()
+            self.get_logger().info("Visual target acquired — switching to TRACK mode.")
+
+    def _get_drone_yaw(self) -> float:
+        if self.have_compass:
+            return self.compass_heading_rad
+
+        q = self.drone_pose.pose.orientation
+        return self._quat_to_yaw(q.x, q.y, q.z, q.w)
+
+    def _visual_camera_target_fresh(self, now: float) -> bool:
+        return (
+            self.last_visual_camera_time is not None
+            and (now - self.last_visual_camera_time) <= self.target_timeout_sec
+        )
 
     # ------------------------------------------------------------------
     # Callbacks
@@ -247,36 +456,26 @@ class RelativePositionController(Node):
             self._takeoff_complete_time = self._now()
             self.get_logger().info(f"Takeoff complete at {alt:.2f} m.")
 
-    def _on_target_odom(self, msg: Odometry):
-        p = msg.pose.pose.position
-        q = msg.pose.pose.orientation
 
-        self.target_x = p.x
-        self.target_y = p.y
-        self.target_z = p.z
-
-        # self.target_heading = self._quat_to_yaw(q.x, q.y, q.z, q.w)
-
-        self.target_received = True
-        self.last_target_time = self._now()
-
-       
-
-    def _on_visual_odom(self, msg):
+    def _on_visual_odom(self, msg: Odometry):
         if not self.have_drone_pose:
             return
 
         if not self.have_gimbal_attitude:
             self.get_logger().warn(
-                "No MAVROS gimbal attitude feedback received yet.",
-                throttle_duration_sec=2.0
+                "No gimbal attitude yet, cannot transform visual target to local frame.",
+                throttle_duration_sec=2.0,
             )
             return
 
-        
-
-        # ArUco detector gives camera/gimbal-relative target orientation.
+        # --------------------------------------------------
+        # 1. Camera optical -> target
+        # /aruco_target/visual_odom is in OpenCV camera optical frame:
+        # x = right, y = down, z = forward
+        # --------------------------------------------------
+        p_vis = msg.pose.pose.position
         q_vis = msg.pose.pose.orientation
+
         T_camera_target = tf_transformations.quaternion_matrix([
             q_vis.x,
             q_vis.y,
@@ -284,8 +483,17 @@ class RelativePositionController(Node):
             q_vis.w,
         ])
 
-        # Drone pose from MAVROS local position.
+        T_camera_target[0, 3] = p_vis.x
+        T_camera_target[1, 3] = p_vis.y
+        T_camera_target[2, 3] = p_vis.z
+
+
+        # --------------------------------------------------
+        # 2. Local/world -> drone body FLU
+        # --------------------------------------------------
+        p_drone = self.drone_pose.pose.position
         q_drone = self.drone_pose.pose.orientation
+
         T_world_body_flu = tf_transformations.quaternion_matrix([
             q_drone.x,
             q_drone.y,
@@ -293,13 +501,14 @@ class RelativePositionController(Node):
             q_drone.w,
         ])
 
-        p_drone = self.drone_pose.pose.position
         T_world_body_flu[0, 3] = p_drone.x
         T_world_body_flu[1, 3] = p_drone.y
         T_world_body_flu[2, 3] = p_drone.z
 
-        # MAVROS gimbal TF uses base_link_frd.
-        # Convert body FLU -> body FRD.
+        # --------------------------------------------------
+        # 3. Body FRD -> body FLU
+        # This lets us chain world -> FLU -> FRD
+        # --------------------------------------------------
         T_flu_frd = np.eye(4)
         T_flu_frd[:3, :3] = np.array([
             [1.0,  0.0,  0.0],
@@ -307,40 +516,73 @@ class RelativePositionController(Node):
             [0.0,  0.0, -1.0],
         ])
 
-        # Live gimbal transform from MAVROS TF:
-        T_frd_gimbal = self.T_frd_gimbal
-
-        # Approximate optical camera correction.
-        # If gimbal_0 already behaves like your camera optical frame, set this to identity.
-        T_gimbal_camera = np.eye(4)
-
-        # Final chain:
-        # world -> drone_body_flu -> drone_body_frd -> gimbal -> camera -> aruco_target
+        # --------------------------------------------------
+        # 4. Full transform:
+        # world -> body FLU -> body FRD -> gimbal FRD -> camera optical -> target
+        # --------------------------------------------------
         T_world_target = (
             T_world_body_flu
             @ T_flu_frd
-            @ T_frd_gimbal
-            @ T_gimbal_camera
+            @ self.T_frd_gimbal
+            @ self.T_gimbal_camera
             @ T_camera_target
         )
 
+        # --------------------------------------------------
+        # 5. Update target position
+        # --------------------------------------------------
+        self.visual_cam_x = float(p_vis.x)
+        self.visual_cam_y = float(p_vis.y)
+        self.visual_cam_z = float(p_vis.z)
+        self.last_visual_camera_time = self._now()
+
+        self.target_x = float(T_world_target[0, 3])
+        self.target_y = float(T_world_target[1, 3])
+        self.target_z = float(T_world_target[2, 3])
+
+        # --------------------------------------------------
+        # 6. Update target heading
+        # --------------------------------------------------
         q_world_target = tf_transformations.quaternion_from_matrix(T_world_target)
 
-        visual_heading_world = self._quat_to_yaw(
-            q_world_target[0],
-            q_world_target[1],
-            q_world_target[2],
-            q_world_target[3],
+        self.target_heading = self._wrap_to_pi(
+            self._quat_to_yaw(
+                q_world_target[0],
+                q_world_target[1],
+                q_world_target[2],
+                q_world_target[3],
+            )
         )
 
-        self.target_heading = self._wrap_to_pi(visual_heading_world)
+        self.target_received = True
+        self.last_target_time = self._now()
+
+        if hasattr(self, "_exit_search_mode"):
+            self._exit_search_mode()
+
+        visual_distance = math.sqrt(
+            p_vis.x * p_vis.x +
+            p_vis.y * p_vis.y +
+            p_vis.z * p_vis.z
+        )
 
         self.get_logger().info(
-            f"Visual heading using MAVROS gimbal TF: "
-            f"{math.degrees(self.target_heading):.2f} deg",
-            throttle_duration_sec=0.5
+            f"Visual target: camera_dist={visual_distance:.2f} m, "
+            f"camera_optical=({p_vis.x:.2f}, {p_vis.y:.2f}, {p_vis.z:.2f}), ",
+            # f"local=({self.target_x:.2f}, {self.target_y:.2f}, {self.target_z:.2f}), "
+            # f"heading={math.degrees(self.target_heading):.2f} deg",
+            throttle_duration_sec=0.5,
         )
 
+    def _on_target_found(self, msg: Bool):
+        self._last_target_found_msg = bool(msg.data)
+        if not msg.data:
+            return
+
+        # self.get_logger().info(
+        #     "ArUco marker detected in image; waiting for visual odometry pose.",
+        #     throttle_duration_sec=2.0,
+        # )
 
     def compass_callback(self, msg: Float64):
         heading_deg = float(msg.data)
@@ -367,7 +609,7 @@ class RelativePositionController(Node):
             q.z,
             q.w,
         ])
-
+        self.gimbal_feedback_flags = msg.flags
         self.have_gimbal_attitude = True
 
         roll, pitch, yaw = tf_transformations.euler_from_quaternion([
@@ -378,12 +620,10 @@ class RelativePositionController(Node):
         ])
 
         # self.get_logger().info(
-        #     f"Gimbal attitude feedback: "
-        #     f"roll={math.degrees(roll):.2f}, "
-        #     f"pitch={math.degrees(pitch):.2f}, "
-        #     f"yaw={math.degrees(yaw):.2f}, "
-        #     f"flags={msg.flags}",
-        #     throttle_duration_sec=1.0
+        #     f"Gimbal feedback: roll={math.degrees(roll):.2f} deg, "
+        #     f"pitch={math.degrees(pitch):.2f} deg, "
+        #     f"yaw={math.degrees(yaw):.2f} deg, flags={msg.flags}",
+        #     throttle_duration_sec=2.0,
         # )
 
     def _transform_to_matrix(self, tf_msg):
@@ -407,6 +647,13 @@ class RelativePositionController(Node):
         while angle < -math.pi:
             angle += 2.0 * math.pi
         return angle
+
+    def _angle_diff(self, a, b):
+        return self._wrap_to_pi(a - b)
+
+    def _smooth_angle(self, old_angle, new_angle, alpha):
+        diff = self._wrap_to_pi(new_angle - old_angle)
+        return self._wrap_to_pi(old_angle + alpha * diff)
 
     def _body_to_world(self, x_body, y_body, heading):
         c = math.cos(heading)
@@ -523,7 +770,7 @@ class RelativePositionController(Node):
             self._tko_requested = False
 
     def _configure_gimbal(self):
-        if self._gimbal_configured:
+        if self._gimbal_configured or self._gimbal_config_in_progress:
             return
 
         if not self.gimbal_config_client.wait_for_service(timeout_sec=0.1):
@@ -538,13 +785,15 @@ class RelativePositionController(Node):
         req.compid_primary = -2
         req.sysid_secondary = 0
         req.compid_secondary = 0
-        req.gimbal_device_id = 0
+        req.gimbal_device_id = self.gimbal_device_id
 
+        self._gimbal_config_in_progress = True
         fut = self.gimbal_config_client.call_async(req)
         fut.add_done_callback(self._on_gimbal_config_done)
 
     
     def _on_gimbal_config_done(self, fut):
+        self._gimbal_config_in_progress = False
         try:
             res = fut.result()
         except Exception as e:
@@ -625,44 +874,46 @@ class RelativePositionController(Node):
             )
             return
 
-        if not self.target_received:
-            self.get_logger().warn(
-                "Tracking enabled but no target odom received — holding.",
-                throttle_duration_sec=5.0,
-            )
-            self._publish_zero(msg)
-            return
+        # if not self._target_available(now):
+        #     if self.enable_search_mode:
+        #         self._publish_search_setpoint(msg, drone_x, drone_y, drone_z)
+        #     else:
+        #         self.get_logger().warn(
+        #             "Tracking enabled but no visual target received — holding.",
+        #             throttle_duration_sec=5.0,
+        #         )
+        #         self._publish_zero(msg)
+        #     return
 
-        if not self._target_is_fresh(now):
-            self.get_logger().warn(
-                "Target odom stale — holding.",
-                throttle_duration_sec=2.0,
-            )
-            self._publish_zero(msg)
-            return
-
-        if self.have_compass:
-            drone_yaw = self.compass_heading_rad
-        else:
-            q = self.drone_pose.pose.orientation
-            drone_yaw = self._quat_to_yaw(q.x, q.y, q.z, q.w)
+        self._exit_search_mode()
+        drone_yaw = self._get_drone_yaw()
 
         # --------------------------------------------------
-        # Use target position from /aruco_target/odom,
-        # and target_heading from /aruco_target/visual_odom.
-        #
-        # The desired relative point is:
+        # Use target position from visual ArUco odom when enabled.
         # target_position + R(target_heading) * body_offset
         # --------------------------------------------------
+
+        shot_offset = self.cinematic_planner.update(now)
+
         rel_x_world, rel_y_world = self._body_to_world(
-            self.rel_x_body,
-            self.rel_y_body,
+            shot_offset.x,
+            shot_offset.y,
             self.target_heading,
         )
 
         desired_x = self.target_x + rel_x_world
         desired_y = self.target_y + rel_y_world
-        desired_z = self.target_z + self.rel_z_body
+        desired_z = self.target_z + shot_offset.z
+
+        # rel_x_world, rel_y_world = self._body_to_world(
+        #     self.rel_x_body,
+        #     self.rel_y_body,
+        #     self.target_heading,
+        # )
+
+        # desired_x = self.target_x + rel_x_world
+        # desired_y = self.target_y + rel_y_world
+        # desired_z = self.target_z + self.rel_z_body
 
         
         ex = desired_x - drone_x
@@ -674,13 +925,15 @@ class RelativePositionController(Node):
             self.target_x - drone_x,
         )
         eyaw = self._wrap_to_pi(desired_yaw - drone_yaw)
-        # eyaw = 0
+    
 
-        # self.get_logger().info(f"desired_x: {desired_x:.2f}, desired_y: {desired_y:.2f}, desired_z: {desired_z:.2f}")
-        # self.get_logger().info(f"ex: {ex:.2f}, ey: {ey:.2f}, ez: {ez:.2f}, eyaw: {math.degrees(eyaw):.2f} deg")
-        # self.get_logger().info(f"desired_yaw: {math.degrees(desired_yaw):.2f} deg")
-        # self.get_logger().info(f"drone_yaw: {math.degrees(drone_yaw):.2f} deg")
-        # self.get_logger().info(f"eyaw: {math.degrees(eyaw):.2f} deg")
+        self.get_logger().info(
+        f"SHOT offset=({shot_offset.x:.2f}, {shot_offset.y:.2f}, {shot_offset.z:.2f}), "
+        f"desired=({desired_x:.2f}, {desired_y:.2f}, {desired_z:.2f}), "
+        f"target=({self.target_x:.2f}, {self.target_y:.2f}, {self.target_z:.2f}), "
+        f"heading={math.degrees(self.target_heading):.1f}",
+        throttle_duration_sec=0.5,
+)
 
         cmd = self.pid.update_from_error(
             ex=ex,
@@ -709,18 +962,43 @@ class RelativePositionController(Node):
         )
 
     def _publish_gimbal_setpoint(self):
-        if not self.target_received or not self.have_drone_pose:
+        if not self.have_drone_pose:
+            self._send_gimbal_pitchyaw(
+                pitch_rad=0.0,
+                yaw_rad=0.0,
+            )
             return
 
         now = self._now()
-        if not self._target_is_fresh(now):
+
+        # 1. If visual target is currently visible, use image-space PD.
+        if self._visual_camera_target_fresh(now):
+            cmd = self.gimbal.update_image_pd(
+                cam_x=self.visual_cam_x,
+                cam_y=self.visual_cam_y,
+                cam_z=self.visual_cam_z,
+                current_pitch=self.current_gimbal_pitch,
+                current_yaw=self.current_gimbal_yaw,
+                now=now,
+            )
+
+            self._send_gimbal_pitchyaw(
+                pitch_rad=cmd.pitch,
+                yaw_rad=cmd.yaw,
+            )
             return
 
+        # 2. If no visual target, search.
+        if not self.target_received or not self._target_is_fresh(now):
+            if self.enable_search_mode and self._tracking_enabled:
+                self._publish_search_gimbal_setpoint()
+            return
+
+        # 3. Fallback: point at last known local target pose.
         drone_x = self.drone_pose.pose.position.x
         drone_y = self.drone_pose.pose.position.y
         drone_z = self.drone_pose.pose.position.z
-        q = self.drone_pose.pose.orientation
-        drone_yaw = self._quat_to_yaw(q.x, q.y, q.z, q.w)
+        drone_yaw = self._get_drone_yaw()
 
         cmd = self.gimbal.update(
             drone_x=drone_x,
@@ -732,13 +1010,62 @@ class RelativePositionController(Node):
             target_z=self.target_z,
         )
 
-        # MAVROS GimbalManagerPitchyaw supports pitch/yaw, not roll.
         self._send_gimbal_pitchyaw(
-            pitch_rad=-cmd.pitch,
-            yaw_rad=-cmd.yaw,
+            pitch_rad=cmd.pitch,
+            yaw_rad=cmd.yaw,
         )
 
     
+    def _publish_search_setpoint(self, msg: TwistStamped, drone_x: float, drone_y: float, drone_z: float):
+        self._enter_search_mode()
+
+        drone_yaw = self._get_drone_yaw()
+        vx = self.search_forward_speed * math.cos(drone_yaw)
+        vy = self.search_forward_speed * math.sin(drone_yaw)
+
+        alt_error = self.target_altitude - drone_z
+        vz = self.search_altitude_kp * alt_error
+        vz = max(-self.search_max_vertical_speed, min(self.search_max_vertical_speed, vz))
+
+        msg.twist.linear.x = vx
+        msg.twist.linear.y = vy
+        msg.twist.linear.z = vz
+        msg.twist.angular.z = self.search_yaw_rate
+        self.vel_pub.publish(msg)
+
+        now = self._now()
+        if now - self._last_search_log_time > 2.0:
+            self._last_search_log_time = now
+            # self.get_logger().info(
+            #     f"SEARCH: vx={vx:.2f}, vy={vy:.2f}, vz={vz:.2f}, "
+            #     f"yaw_rate={math.degrees(self.search_yaw_rate):.1f} deg/s, "
+            #     f"alt={drone_z:.2f} m"
+            # )
+
+        self._log_csv(
+            "search", drone_x, drone_y, drone_z,
+            drone_x, drone_y, self.target_altitude,
+            0.0, 0.0, alt_error, 0.0,
+            vx, vy, vz, self.search_yaw_rate,
+            None, math.degrees(self.current_gimbal_pitch), math.degrees(self.current_gimbal_yaw),
+        )
+
+    def _publish_search_gimbal_setpoint(self):
+        self._enter_search_mode()
+        t = self._now() - self._search_start_time
+        phase = 2.0 * math.pi * (t / self.search_gimbal_period_sec)
+
+        yaw_cmd = self.search_gimbal_yaw_amp * math.sin(phase)
+        pitch_cmd = (
+            self.search_gimbal_pitch_center
+            + self.search_gimbal_pitch_amp * math.sin(0.5 * phase)
+        )
+
+        self._send_gimbal_pitchyaw(
+            pitch_rad=pitch_cmd,
+            yaw_rad=yaw_cmd,
+        )
+
     def _send_gimbal_pitchyaw(self, pitch_rad, yaw_rad):
         if not self._gimbal_configured:
             self._configure_gimbal()
@@ -746,8 +1073,8 @@ class RelativePositionController(Node):
 
         now = self._now()
 
-        # Limit service calls to around 5 Hz.
-        if now - self._last_gimbal_cmd_time < 0.2:
+        # Limit service calls to avoid spamming COMMAND_LONG.
+        if now - self._last_gimbal_cmd_time < self.gimbal_command_period_sec:
             return
 
         if not self.gimbal_pitchyaw_client.wait_for_service(timeout_sec=0.1):
@@ -764,7 +1091,7 @@ class RelativePositionController(Node):
         req.pitch_rate = 0.0
         req.yaw_rate = 0.0
         req.flags = 0
-        req.gimbal_device_id = 0
+        req.gimbal_device_id = self.gimbal_device_id
 
         self.current_gimbal_pitch = pitch_rad
         self.current_gimbal_yaw = yaw_rad

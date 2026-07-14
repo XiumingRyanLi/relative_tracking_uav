@@ -28,8 +28,8 @@ class PIDRelativeController:
     def __init__(self, dt: float = 0.15):
         self.dt = dt
 
-        self.kp_x, self.ki_x, self.kd_x = 0.60, 0.02, 0.10
-        self.kp_y, self.ki_y, self.kd_y = 0.60, 0.02, 0.10
+        self.kp_x, self.ki_x, self.kd_x = 0.80, 0.02, 0.10
+        self.kp_y, self.ki_y, self.kd_y = 0.80, 0.02, 0.10
         self.kp_z, self.ki_z, self.kd_z = 0.60, 0.03, 0.10
         self.kp_yaw, self.ki_yaw, self.kd_yaw = 0.80, 0.00, 0.00
 
