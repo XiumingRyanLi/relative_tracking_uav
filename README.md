@@ -136,4 +136,7 @@ ros2 run circumnavigation_controller relative_position_controller
 ```bash
 gz topic -t "/cmd_rover_vel" -m gz.msgs.Twist -p "linear: {x: 0.6}, angular: {z: 1.0}"
 
+gz topic -t /cmd_vel -m gz.msgs.Twist -p "linear: {x:1.0}, angular: {z: 0.0}"
+
+
 ```
