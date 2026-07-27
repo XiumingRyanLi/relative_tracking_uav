@@ -2,6 +2,7 @@
 import math
 import csv
 from datetime import datetime
+from turtle import stamp
 
 try:
     from .cinematic_planner import CinematicPlanner
@@ -12,6 +13,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from rclpy.executors import MultiThreadedExecutor
+from collections import deque
 
 from geometry_msgs.msg import PoseStamped, TwistStamped
 from nav_msgs.msg import Odometry
@@ -21,9 +23,13 @@ from std_msgs.msg import Float64, Bool
 try:
     from .pid_controller import PIDRelativeController
     from .gimbal_controller import GimbalController
+    from .target_kalman_filter import TargetKalmanFilter
+    from .target_ctrv_ukf import TargetCTRVUKF
 except ImportError:
     from pid_controller import PIDRelativeController
     from gimbal_controller import GimbalController
+    from target_kalman_filter import TargetKalmanFilter
+    from target_ctrv_ukf import TargetCTRVUKF
 
 import numpy as np
 if not hasattr(np, "float"):
@@ -62,18 +68,12 @@ class RelativePositionController(Node):
         # ---------------- Parameters ----------------
         self.declare_parameter("target_odom_topic", "/aruco_target/odom")
         self.declare_parameter("target_altitude", 3.0)
-        self.declare_parameter("rel_x_body", -2.0)
-        self.declare_parameter("rel_y_body", 0.0)
-        self.declare_parameter("rel_z_body", 3.0)
-        self.declare_parameter("target_timeout_sec", 5.0)
+        self.declare_parameter("target_timeout_sec", 10.0)
         self.declare_parameter("hover_delay_sec", 4.0)
-        self.declare_parameter("boundary_limit", 40.0)
+        self.declare_parameter("boundary_limit", 1000.0)
 
         self.target_odom_topic = self.get_parameter("target_odom_topic").value
         self.target_altitude = float(self.get_parameter("target_altitude").value)
-        self.rel_x_body = float(self.get_parameter("rel_x_body").value)
-        self.rel_y_body = float(self.get_parameter("rel_y_body").value)
-        self.rel_z_body = float(self.get_parameter("rel_z_body").value)
         self.target_timeout_sec = float(self.get_parameter("target_timeout_sec").value)
         self.hover_delay_sec = float(self.get_parameter("hover_delay_sec").value)
         self.boundary_limit = float(self.get_parameter("boundary_limit").value)
@@ -91,12 +91,28 @@ class RelativePositionController(Node):
             axes="sxyz",
         )
 
-        # Visual-heading filtering. ArUCo orientation is noisy at long range,
-        # so update target heading only when the visual estimate is plausible.
+        # Target heading/yaw-rate estimation. A CTRV UKF (separate from
+        # the translational CV KF below) filters heading and yaw rate.
+        # enable_visual_heading_filter, max_visual_heading_distance and
+        # max_visual_heading_jump_deg gate the UKF's heading updates
+        # (i.e. whether a given frame's heading measurement is trusted).
+        # enable_heading_ukf is a separate, full kill switch for the UKF
+        # itself -- set False to bypass it entirely and fall back to the
+        # old behaviour (raw, unfiltered per-frame heading), e.g. for A/B
+        # testing filtered vs. unfiltered heading on the bench or in sim.
+        # visual_heading_alpha is superseded by the UKF's own
+        # process-noise tuning and is no longer used.
         self.declare_parameter("visual_heading_alpha", 0.25)
         self.declare_parameter("max_visual_heading_jump_deg", 60.0)
         self.declare_parameter("max_visual_heading_distance", 5.0)
-        self.declare_parameter("enable_visual_heading_filter", True)
+        self.declare_parameter("enable_visual_heading_filter", False)
+        self.declare_parameter("enable_heading_ukf", False)
+        self.declare_parameter("ukf_std_a", 1.5)
+        self.declare_parameter("ukf_std_yawdd", 0.5)
+        self.declare_parameter("ukf_std_pos", 0.15)
+        self.declare_parameter("ukf_std_yaw", 0.20)
+        self.declare_parameter("ukf_coast_timeout_sec", 1.0)
+        self.declare_parameter("ukf_max_yaw_rate", 3.0)
         self.visual_heading_alpha = float(self.get_parameter("visual_heading_alpha").value)
         self.max_visual_heading_jump = math.radians(
             float(self.get_parameter("max_visual_heading_jump_deg").value)
@@ -106,6 +122,10 @@ class RelativePositionController(Node):
         )
         self.enable_visual_heading_filter = bool(
             self.get_parameter("enable_visual_heading_filter").value
+        )
+        self.enable_heading_ukf = bool(self.get_parameter("enable_heading_ukf").value)
+        self.ukf_coast_timeout_sec = float(
+            self.get_parameter("ukf_coast_timeout_sec").value
         )
         self.visual_heading_valid = False
         self.filtered_target_heading = 0.0
@@ -141,6 +161,28 @@ class RelativePositionController(Node):
         )
         self.visual_position_valid = False
         self.filtered_target_position = np.zeros(3, dtype=float)
+
+        # Target velocity estimation. A linear constant-velocity Kalman
+        # filter runs on the already-transformed world-frame target
+        # position (see _on_visual_odom) and produces a velocity estimate
+        # used as PID feedforward, so the drone matches the target's
+        # motion instead of only reacting to lag-induced position error.
+        self.declare_parameter("enable_velocity_feedforward", True)
+        self.declare_parameter("kf_accel_noise_std", 1.5)
+        self.declare_parameter("kf_measurement_noise_std", 0.15)
+        self.declare_parameter("kf_initial_pos_std", 1.0)
+        self.declare_parameter("kf_initial_vel_std", 3.0)
+        self.declare_parameter("kf_max_target_speed", 15.0)
+        self.declare_parameter("kf_coast_timeout_sec", 1.0)
+        self.declare_parameter("kf_enable_adaptive_q", True)
+        self.declare_parameter("kf_adaptive_q_max_scale", 12.0)
+        self.declare_parameter("kf_adaptive_q_decay", 0.5)
+        self.enable_velocity_feedforward = bool(
+            self.get_parameter("enable_velocity_feedforward").value
+        )
+        self.kf_coast_timeout_sec = float(
+            self.get_parameter("kf_coast_timeout_sec").value
+        )
 
         # Search/acquisition behaviour. Before a visual target is received,
         # do not hold at the initial zero target. Instead, slowly explore and
@@ -206,6 +248,10 @@ class RelativePositionController(Node):
         self.have_gimbal_attitude = False
         self.T_frd_gimbal = np.eye(4)
         self.gimbal_feedback_flags = 0
+        self.declare_parameter("pose_history_buffer_sec", 2.0)
+        self.pose_history_buffer_sec = float(self.get_parameter("pose_history_buffer_sec").value)
+        self._gimbal_attitude_history = deque()
+        self._drone_pose_history = deque()
 
         self.T_gimbal_camera = np.eye(4)
         self.T_gimbal_camera[:3, :3] = np.array([
@@ -217,6 +263,26 @@ class RelativePositionController(Node):
         # ---------------- Pure controllers ----------------
         self.pid = PIDRelativeController(dt=0.15)
         self.gimbal = GimbalController()
+        self.target_kf = TargetKalmanFilter(
+            accel_noise_std=float(self.get_parameter("kf_accel_noise_std").value),
+            measurement_noise_std=float(self.get_parameter("kf_measurement_noise_std").value),
+            initial_pos_std=float(self.get_parameter("kf_initial_pos_std").value),
+            initial_vel_std=float(self.get_parameter("kf_initial_vel_std").value),
+            max_speed=float(self.get_parameter("kf_max_target_speed").value),
+            enable_adaptive_q=bool(self.get_parameter("kf_enable_adaptive_q").value),
+            adaptive_q_max_scale=float(self.get_parameter("kf_adaptive_q_max_scale").value),
+            adaptive_q_decay=float(self.get_parameter("kf_adaptive_q_decay").value),
+        )
+        self._kf_last_update_time = None
+
+        self.target_ukf = TargetCTRVUKF(
+            std_a=float(self.get_parameter("ukf_std_a").value),
+            std_yawdd=float(self.get_parameter("ukf_std_yawdd").value),
+            std_pos=float(self.get_parameter("ukf_std_pos").value),
+            std_yaw=float(self.get_parameter("ukf_std_yaw").value),
+            max_yaw_rate=float(self.get_parameter("ukf_max_yaw_rate").value),
+        )
+        self._ukf_last_update_time = None
 
         # ---------------- Subscriptions ----------------
         self.state_sub = self.create_subscription(
@@ -279,11 +345,23 @@ class RelativePositionController(Node):
 
         # ---------------- Target state ----------------
         self.target_x = 0.0
-        self.target_y = 0.0
+        self.target_y = 3.0
         self.target_z = 0.0
         self.target_heading = 0.0
         self.target_received = False
         self.last_target_time = None
+
+        # Target velocity estimate (world frame, m/s) from target_kf.
+        # Used as PID feedforward. Zero until the filter has seen at
+        # least two measurements.
+        self.target_vx = 0.0
+        self.target_vy = 0.0
+        self.target_vz = 0.0
+
+        # Target yaw-rate estimate (rad/s) from target_ukf. Available for
+        # future use (e.g. heading extrapolation through brief occlusion);
+        # not yet consumed downstream beyond target_heading itself.
+        self.target_yaw_rate = 0.0
 
         # Latest visual target measurement in camera optical frame
         self._search_start_time = None
@@ -298,47 +376,47 @@ class RelativePositionController(Node):
         self.cinematic_planner = CinematicPlanner()
 
         self.cinematic_planner.set_sequence([
+            {
+                "type": "hold_location",
+                "location": "right",
+                "radius": 2.0,
+                "height": 3.0,
+                "duration": 100.0,
+            },
+            # {
+            #     "type": "move_location",
+            #     "from": "back",
+            #     "to": "front",
+            #     "radius": 3.0,
+            #     "height": 3.0,
+            #     "duration": 10.0,
+            # },
+            # {
+            #     "type": "overpass",
+            #     "from": "front",
+            #     "to": "back",
+            #     "radius": 3.0,
+            #     "start_height": 3.0,
+            #     "peak_height": 3.5,
+            #     "end_height": 3.0,
+            #     "duration": 15.0,
+            # },
             # {
             #     "type": "hold_location",
             #     "location": "right",
             #     "radius": 3.0,
             #     "height": 3.0,
-            #     "duration": 20.0,
+            #     "duration": 5.0,
             # },
-            {
-                "type": "move_location",
-                "from": "back",
-                "to": "front",
-                "radius": 3.0,
-                "height": 3.0,
-                "duration": 10.0,
-            },
-            {
-                "type": "overpass",
-                "from": "front",
-                "to": "back",
-                "radius": 3.0,
-                "start_height": 3.0,
-                "peak_height": 3.5,
-                "end_height": 3.0,
-                "duration": 15.0,
-            },
-            {
-                "type": "hold_location",
-                "location": "right",
-                "radius": 3.0,
-                "height": 3.0,
-                "duration": 5.0,
-            },
-            {
-                "type": "move_location",
-                "from": "right",
-                "to": "left",
-                "via": "front",
-                "radius": 3.0,
-                "height": 3.0,
-                "duration": 12.0,
-            },
+            # {
+            #     "type": "move_location",
+            #     "from": "right",
+            #     "to": "left",
+            #     "via": "front",
+            #     "radius": 3.0,
+            #     "height": 3.0,
+            #     "duration": 12.0,
+            # },
 
 
         ]) 
@@ -412,6 +490,19 @@ class RelativePositionController(Node):
                 "Drone will move slowly and sweep the gimbal."
             )
 
+    def _stamp_to_sec(self, stamp) -> float:
+        return float(stamp.sec) + float(stamp.nanosec) * 1e-9
+
+    def _trim_history(self, buf: deque, now_sec: float):
+        while buf and (now_sec - buf[0][0]) > self.pose_history_buffer_sec:
+            buf.popleft()
+
+    def _lookup_closest_in_history(self, buf: deque, target_sec: float):
+        if not buf:
+            return None, None
+        best = min(buf, key=lambda entry: abs(entry[0] - target_sec))
+        return best[1], abs(best[0] - target_sec)
+
     def _exit_search_mode(self):
         if self._search_start_time is not None:
             self._search_start_time = None
@@ -450,6 +541,13 @@ class RelativePositionController(Node):
         self.drone_pose = msg
         self.have_drone_pose = True
 
+        t_sec = self._stamp_to_sec(msg.header.stamp)
+        if t_sec == 0.0:
+            t_sec = self._now()
+        p, q = msg.pose.position, msg.pose.orientation
+        self._drone_pose_history.append((t_sec, (p.x, p.y, p.z, q.x, q.y, q.z, q.w)))
+        self._trim_history(self._drone_pose_history, t_sec)
+
         alt = msg.pose.position.z
         if self._armed_confirmed and not self._tko_reached and alt >= self.target_altitude - 0.5:
             self._tko_reached = True
@@ -460,14 +558,14 @@ class RelativePositionController(Node):
     def _on_visual_odom(self, msg: Odometry):
         if not self.have_drone_pose:
             return
-
+ 
         if not self.have_gimbal_attitude:
             self.get_logger().warn(
                 "No gimbal attitude yet, cannot transform visual target to local frame.",
                 throttle_duration_sec=2.0,
             )
             return
-
+ 
         # --------------------------------------------------
         # 1. Camera optical -> target
         # /aruco_target/visual_odom is in OpenCV camera optical frame:
@@ -475,36 +573,88 @@ class RelativePositionController(Node):
         # --------------------------------------------------
         p_vis = msg.pose.pose.position
         q_vis = msg.pose.pose.orientation
-
+ 
         T_camera_target = tf_transformations.quaternion_matrix([
             q_vis.x,
             q_vis.y,
             q_vis.z,
             q_vis.w,
         ])
-
+ 
         T_camera_target[0, 3] = p_vis.x
         T_camera_target[1, 3] = p_vis.y
         T_camera_target[2, 3] = p_vis.z
+ 
+        # --------------------------------------------------
+        # 1b. Time-synced lookup.
+        # msg.header.stamp is the *capture* time of the frame this
+        # detection came from (set upstream in aruco_detector). Detection
+        # latency + queueing mean "now" is not that time -- the gimbal in
+        # particular may have moved on since capture, especially during
+        # active search sweeps or fast tracking corrections. Look up the
+        # gimbal/drone pose that was actually true at capture time from
+        # the rolling history buffers, instead of using the live values.
+        # --------------------------------------------------
+        target_stamp_sec = self._stamp_to_sec(msg.header.stamp)
+        if target_stamp_sec == 0.0:
+            target_stamp_sec = self._now()
 
+        # Anything further off than the buffer window itself means the match
+        # isn't meaningful -- most likely a clock domain mismatch (sim time vs.
+        # MAVROS/FCU time) rather than genuine detection latency. Fall back to
+        # the live value in that case instead of using a nonsense match.
+        max_lookup_gap_sec = self.pose_history_buffer_sec
 
+        gimbal_hist, gimbal_gap = self._lookup_closest_in_history(
+            self._gimbal_attitude_history, target_stamp_sec
+        )
+        if gimbal_hist is not None and gimbal_gap is not None and gimbal_gap <= max_lookup_gap_sec:
+            T_frd_gimbal = gimbal_hist
+        else:
+            T_frd_gimbal = self.T_frd_gimbal
+            if gimbal_hist is not None:
+                self.get_logger().warn(
+                    f"Gimbal history match {gimbal_gap:.2f}s from capture time -- "
+                    f"ignoring history, using live value. Check clock domains "
+                    f"(use_sim_time) across aruco_detector/controller/mavros.",
+                    throttle_duration_sec=2.0,
+                )
+
+        drone_hist, drone_gap = self._lookup_closest_in_history(
+            self._drone_pose_history, target_stamp_sec
+        )
+        if drone_hist is not None and drone_gap is not None and drone_gap <= max_lookup_gap_sec:
+            dpx, dpy, dpz, dqx, dqy, dqz, dqw = drone_hist
+        else:
+            p_drone_live = self.drone_pose.pose.position
+            q_drone_live = self.drone_pose.pose.orientation
+            dpx, dpy, dpz = p_drone_live.x, p_drone_live.y, p_drone_live.z
+            dqx, dqy, dqz, dqw = q_drone_live.x, q_drone_live.y, q_drone_live.z, q_drone_live.w
+            if drone_hist is not None:
+                self.get_logger().warn(
+                    f"Drone pose history match {drone_gap:.2f}s from capture time -- "
+                    f"ignoring history, using live value.",
+                    throttle_duration_sec=2.0,
+                )
+
+        if gimbal_hist is not None and gimbal_gap is not None and 0.10 < gimbal_gap <= max_lookup_gap_sec:
+            self.get_logger().warn(
+                f"Gimbal attitude history match is {gimbal_gap * 1000:.0f} ms "
+                f"from frame capture time -- detection latency is significant.",
+                throttle_duration_sec=2.0,
+            )
+ 
         # --------------------------------------------------
         # 2. Local/world -> drone body FLU
         # --------------------------------------------------
-        p_drone = self.drone_pose.pose.position
-        q_drone = self.drone_pose.pose.orientation
-
         T_world_body_flu = tf_transformations.quaternion_matrix([
-            q_drone.x,
-            q_drone.y,
-            q_drone.z,
-            q_drone.w,
+            dqx, dqy, dqz, dqw,
         ])
-
-        T_world_body_flu[0, 3] = p_drone.x
-        T_world_body_flu[1, 3] = p_drone.y
-        T_world_body_flu[2, 3] = p_drone.z
-
+ 
+        T_world_body_flu[0, 3] = dpx
+        T_world_body_flu[1, 3] = dpy
+        T_world_body_flu[2, 3] = dpz
+ 
         # --------------------------------------------------
         # 3. Body FRD -> body FLU
         # This lets us chain world -> FLU -> FRD
@@ -515,7 +665,7 @@ class RelativePositionController(Node):
             [0.0, -1.0,  0.0],
             [0.0,  0.0, -1.0],
         ])
-
+ 
         # --------------------------------------------------
         # 4. Full transform:
         # world -> body FLU -> body FRD -> gimbal FRD -> camera optical -> target
@@ -523,11 +673,11 @@ class RelativePositionController(Node):
         T_world_target = (
             T_world_body_flu
             @ T_flu_frd
-            @ self.T_frd_gimbal
+            @ T_frd_gimbal
             @ self.T_gimbal_camera
             @ T_camera_target
         )
-
+ 
         # --------------------------------------------------
         # 5. Update target position
         # --------------------------------------------------
@@ -535,17 +685,48 @@ class RelativePositionController(Node):
         self.visual_cam_y = float(p_vis.y)
         self.visual_cam_z = float(p_vis.z)
         self.last_visual_camera_time = self._now()
-
+ 
         self.target_x = float(T_world_target[0, 3])
         self.target_y = float(T_world_target[1, 3])
         self.target_z = float(T_world_target[2, 3])
-
+ 
         # --------------------------------------------------
-        # 6. Update target heading
+        # 5b. Target velocity estimate via linear KF (world frame).
+        # The nonlinear camera->world transform already happened above,
+        # so the filter only ever sees a noisy xyz point -- a plain
+        # constant-velocity linear KF is sufficient here, no EKF/UKF
+        # needed. See target_kalman_filter.py for details.
+        # --------------------------------------------------
+        # Use the frame's capture time (not reception time) for dt, so
+        # detection-latency jitter doesn't get baked into the velocity
+        # estimate as spurious acceleration.
+        kf_now = target_stamp_sec
+        position_meas = (self.target_x, self.target_y, self.target_z)
+ 
+        if (
+            self._kf_last_update_time is None
+            or (kf_now - self._kf_last_update_time) > self.kf_coast_timeout_sec
+        ):
+            # First measurement, or the previous one is too old to trust
+            # a predict step from -- start clean instead of predicting
+            # over a large/garbage dt.
+            self.target_kf.reset(position_meas)
+        else:
+            dt_kf = kf_now - self._kf_last_update_time
+            self.target_kf.predict(dt_kf)
+            self.target_kf.update(position_meas)
+ 
+        self._kf_last_update_time = kf_now
+        self.target_vx, self.target_vy, self.target_vz = self.target_kf.get_velocity()
+ 
+        # --------------------------------------------------
+        # 6. Update target heading/yaw-rate via CTRV UKF (world frame).
+        # Unlike the CV filter above, this process model is genuinely
+        # nonlinear (yaw inside sin/cos, multiplied with v and yawd), so
+        # a linear KF is not valid here -- see target_ctrv_ukf.py.
         # --------------------------------------------------
         q_world_target = tf_transformations.quaternion_from_matrix(T_world_target)
-
-        self.target_heading = self._wrap_to_pi(
+        raw_target_heading = self._wrap_to_pi(
             self._quat_to_yaw(
                 q_world_target[0],
                 q_world_target[1],
@@ -553,26 +734,71 @@ class RelativePositionController(Node):
                 q_world_target[3],
             )
         )
-
-        self.target_received = True
-        self.last_target_time = self._now()
-
-        if hasattr(self, "_exit_search_mode"):
-            self._exit_search_mode()
-
+ 
         visual_distance = math.sqrt(
             p_vis.x * p_vis.x +
             p_vis.y * p_vis.y +
             p_vis.z * p_vis.z
         )
-
+ 
+        if not self.enable_heading_ukf:
+            # Full bypass: old behaviour, raw unfiltered heading straight
+            # from this frame's quaternion. No UKF predict/update runs.
+            self.target_heading = raw_target_heading
+            self.target_yaw_rate = 0.0
+            self._ukf_last_update_time = None  # forces a clean reset() if re-enabled later
+        else:
+            ukf_now = target_stamp_sec
+ 
+            if (
+                self._ukf_last_update_time is None
+                or (ukf_now - self._ukf_last_update_time) > self.ukf_coast_timeout_sec
+            ):
+                self.target_ukf.reset(self.target_x, self.target_y, raw_target_heading)
+            else:
+                dt_ukf = ukf_now - self._ukf_last_update_time
+                self.target_ukf.predict(dt_ukf)
+ 
+                # Decide whether this frame's heading measurement is trustworthy.
+                # ArUco orientation is noisy at range, and a bad single-frame
+                # reading (e.g. near-edge-on marker) can produce a large jump --
+                # in either case, fall back to a position-only update so the
+                # UKF still tracks position/yaw via the motion model without
+                # being corrupted by a bad heading reading.
+                heading_trusted = True
+                if self.enable_visual_heading_filter:
+                    if visual_distance > self.max_visual_heading_distance:
+                        heading_trusted = False
+                    else:
+                        jump = abs(self._wrap_to_pi(raw_target_heading - self.target_ukf.get_heading()))
+                        if jump > self.max_visual_heading_jump:
+                            heading_trusted = False
+ 
+                if heading_trusted:
+                    self.target_ukf.update_position_heading(
+                        self.target_x, self.target_y, raw_target_heading
+                    )
+                else:
+                    self.target_ukf.update_position(self.target_x, self.target_y)
+ 
+            self._ukf_last_update_time = ukf_now
+            self.target_heading = self._wrap_to_pi(self.target_ukf.get_heading())
+            self.target_yaw_rate = self.target_ukf.get_yaw_rate()
+ 
+        self.target_received = True
+        self.last_target_time = self._now()
+ 
+        if hasattr(self, "_exit_search_mode"):
+            self._exit_search_mode()
+ 
         self.get_logger().info(
             f"Visual target: camera_dist={visual_distance:.2f} m, "
-            f"camera_optical=({p_vis.x:.2f}, {p_vis.y:.2f}, {p_vis.z:.2f}), ",
-            # f"local=({self.target_x:.2f}, {self.target_y:.2f}, {self.target_z:.2f}), "
-            # f"heading={math.degrees(self.target_heading):.2f} deg",
+            f"camera_optical=({p_vis.x:.2f}, {p_vis.y:.2f}, {p_vis.z:.2f}), "
+            f"heading={math.degrees(self.target_heading):.1f} deg, "
+            f"yaw_rate={math.degrees(self.target_yaw_rate):.1f} deg/s",
             throttle_duration_sec=0.5,
         )
+
 
     def _on_target_found(self, msg: Bool):
         self._last_target_found_msg = bool(msg.data)
@@ -612,12 +838,19 @@ class RelativePositionController(Node):
         self.gimbal_feedback_flags = msg.flags
         self.have_gimbal_attitude = True
 
-        roll, pitch, yaw = tf_transformations.euler_from_quaternion([
-            q.x,
-            q.y,
-            q.z,
-            q.w,
-        ])
+        header = getattr(msg, "header", None)
+        t_sec = self._stamp_to_sec(header.stamp) if header is not None else 0.0
+        if t_sec == 0.0:
+            t_sec = self._now()
+        self._gimbal_attitude_history.append((t_sec, self.T_frd_gimbal.copy()))
+        self._trim_history(self._gimbal_attitude_history, t_sec)
+
+        # roll, pitch, yaw = tf_transformations.euler_from_quaternion([
+        #     q.x,
+        #     q.y,
+        #     q.z,
+        #     q.w,
+        # ])
 
         # self.get_logger().info(
         #     f"Gimbal feedback: roll={math.degrees(roll):.2f} deg, "
@@ -905,16 +1138,7 @@ class RelativePositionController(Node):
         desired_y = self.target_y + rel_y_world
         desired_z = self.target_z + shot_offset.z
 
-        # rel_x_world, rel_y_world = self._body_to_world(
-        #     self.rel_x_body,
-        #     self.rel_y_body,
-        #     self.target_heading,
-        # )
-
-        # desired_x = self.target_x + rel_x_world
-        # desired_y = self.target_y + rel_y_world
-        # desired_z = self.target_z + self.rel_z_body
-
+        
         
         ex = desired_x - drone_x
         ey = desired_y - drone_y
@@ -931,9 +1155,15 @@ class RelativePositionController(Node):
         f"SHOT offset=({shot_offset.x:.2f}, {shot_offset.y:.2f}, {shot_offset.z:.2f}), "
         f"desired=({desired_x:.2f}, {desired_y:.2f}, {desired_z:.2f}), "
         f"target=({self.target_x:.2f}, {self.target_y:.2f}, {self.target_z:.2f}), "
+        f"target_vel=({self.target_vx:.2f}, {self.target_vy:.2f}, {self.target_vz:.2f}), "
         f"heading={math.degrees(self.target_heading):.1f}",
         throttle_duration_sec=0.5,
 )
+
+        if self.enable_velocity_feedforward:
+            ff_vx, ff_vy, ff_vz = self.target_vx, self.target_vy, self.target_vz
+        else:
+            ff_vx, ff_vy, ff_vz = 0.0, 0.0, 0.0
 
         cmd = self.pid.update_from_error(
             ex=ex,
@@ -943,6 +1173,9 @@ class RelativePositionController(Node):
             desired_x=desired_x,
             desired_y=desired_y,
             desired_z=desired_z,
+            ff_vx=ff_vx,
+            ff_vy=ff_vy,
+            ff_vz=ff_vz,
         )
 
         msg.twist.linear.x = cmd.vx

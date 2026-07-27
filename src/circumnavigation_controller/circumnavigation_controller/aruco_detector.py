@@ -268,7 +268,23 @@ class ArUCoNode(Node):
     def image_callback(self, msg):
         """Process image and detect tag, calculate pose and publish tf_transform"""
         frame = self._bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
-        stamp = self.get_clock().now().to_msg() # Timestamp before image processing, because thats when the image was taken
+
+        # Prefer the incoming image's own timestamp -- that's the true
+        # capture time from the camera driver/sim, i.e. the instant the
+        # pixels we're about to run detection on were actually taken.
+        # Detection + solvePnP can take a few to tens of ms, and by the
+        # time this odom message is published/received downstream the
+        # gimbal may already have moved on to a new attitude. Publishing
+        # the *capture* stamp (not "now") lets the controller look up
+        # the gimbal/drone pose that was true at capture time instead of
+        # whatever the latest live gimbal reading happens to be.
+        if msg.header.stamp.sec != 0 or msg.header.stamp.nanosec != 0:
+            stamp = msg.header.stamp
+        else:
+            # Webcam-sourced Image messages have no stamp set upstream --
+            # fall back to reception time (still taken before processing,
+            # so it's the best available approximation of capture time).
+            stamp = self.get_clock().now().to_msg()
 
         # Ensure inference size matches IR (handles topic frames of any size)
         if frame.shape[0] != self._image_height or frame.shape[1] != self._image_width:

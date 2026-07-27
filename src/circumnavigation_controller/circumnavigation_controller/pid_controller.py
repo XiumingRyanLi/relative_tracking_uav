@@ -28,12 +28,12 @@ class PIDRelativeController:
     def __init__(self, dt: float = 0.15):
         self.dt = dt
 
-        self.kp_x, self.ki_x, self.kd_x = 0.80, 0.02, 0.10
-        self.kp_y, self.ki_y, self.kd_y = 0.80, 0.02, 0.10
+        self.kp_x, self.ki_x, self.kd_x = 0.80, 0.02, 0.30
+        self.kp_y, self.ki_y, self.kd_y = 0.80, 0.02, 0.30
         self.kp_z, self.ki_z, self.kd_z = 0.60, 0.03, 0.10
-        self.kp_yaw, self.ki_yaw, self.kd_yaw = 0.80, 0.00, 0.00
+        self.kp_yaw, self.ki_yaw, self.kd_yaw = 0.60, 0.00, 0.00
 
-        self.max_vel_xy = 10.0
+        self.max_vel_xy = 20.0
         self.max_vel_z = 3.0
         self.max_yaw_rate = 4.0
 
@@ -140,7 +140,24 @@ class PIDRelativeController:
             desired_z=desired_z,
         )
     
-    def update_from_error(self, ex, ey, ez, eyaw, desired_x, desired_y, desired_z):
+    def update_from_error(
+        self,
+        ex,
+        ey,
+        ez,
+        eyaw,
+        desired_x,
+        desired_y,
+        desired_z,
+        ff_vx: float = 0.0,
+        ff_vy: float = 0.0,
+        ff_vz: float = 0.0,
+    ):
+        """ff_vx/vy/vz: world-frame target velocity feedforward (m/s),
+        e.g. from a Kalman filter tracking the target. Added on top of
+        the PID correction so the drone matches the target's motion
+        instead of only reacting to lag-induced position error. Defaults
+        to 0.0, so existing callers behave exactly as before."""
         self.int_ex = self.clamp(self.int_ex + ex * self.dt, self.max_integral_xy)
         self.int_ey = self.clamp(self.int_ey + ey * self.dt, self.max_integral_xy)
         self.int_ez = self.clamp(self.int_ez + ez * self.dt, self.max_integral_z)
@@ -151,9 +168,9 @@ class PIDRelativeController:
         dez = (ez - self.prev_ez) / self.dt
         deyaw = (eyaw - self.prev_eyaw) / self.dt
 
-        vx = self.kp_x * ex + self.ki_x * self.int_ex + self.kd_x * dex
-        vy = self.kp_y * ey + self.ki_y * self.int_ey + self.kd_y * dey
-        vz = self.kp_z * ez + self.ki_z * self.int_ez + self.kd_z * dez
+        vx = self.kp_x * ex + self.ki_x * self.int_ex + self.kd_x * dex + ff_vx
+        vy = self.kp_y * ey + self.ki_y * self.int_ey + self.kd_y * dey + ff_vy
+        vz = self.kp_z * ez + self.ki_z * self.int_ez + self.kd_z * dez + ff_vz
         yaw_rate = self.kp_yaw * eyaw + self.ki_yaw * self.int_eyaw + self.kd_yaw * deyaw
 
         vx = self.clamp(vx, self.max_vel_xy)

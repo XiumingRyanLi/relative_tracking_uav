@@ -93,17 +93,9 @@ ros2 run ros_gz_bridge parameter_bridge \
 
 ```bash
 ros2 run ros_gz_bridge parameter_bridge \
-"/world/iris_runway_new/model/iris_with_gimbal/model/gimbal/link/pitch_link/sensor/camera/image@sensor_msgs/msg/Image[gz.msgs.Image" \
-"/model/LandingVehicle/odometry@nav_msgs/msg/Odometry[gz.msgs.Odometry" \
-"/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock" \
-"/gimbal/cmd_roll@std_msgs/msg/Float64]gz.msgs.Double" \
-"/gimbal/cmd_pitch@std_msgs/msg/Float64]gz.msgs.Double" \
-"/gimbal/cmd_yaw@std_msgs/msg/Float64]gz.msgs.Double" \
-"/world/iris_runway_new/model/iris_with_gimbal/joint_state@sensor_msgs/msg/JointState[gz.msgs.Model" \
---ros-args \
--r /world/iris_runway_new/model/iris_with_gimbal/model/gimbal/link/pitch_link/sensor/camera/image:=/camera/image_raw \
--r /model/LandingVehicle/odometry:=/aruco_target/odom \
--r /world/iris_runway_new/model/iris_with_gimbal/joint_state:=/gimbal/joint_states
+  /world/iris_runway/model/iris_with_gimbal/link/camera_link/sensor/camera/image@sensor_msgs/msg/Image[gz.msgs.Image \
+  /clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock \
+  --ros-args -r /world/iris_runway/model/iris_with_gimbal/link/camera_link/sensor/camera/image:=/camera/image_raw
 ```
 
 
