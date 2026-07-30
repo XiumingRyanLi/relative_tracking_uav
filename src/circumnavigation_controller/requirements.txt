@@ -1,0 +1,19 @@
+# Python (pip) dependencies for circumnavigation_controller.
+#
+# NOTE: This only covers packages installable via pip. The ROS 2
+# packages this code also depends on (rclpy, cv_bridge, tf2_ros,
+# mavros_msgs, sensor_msgs, geometry_msgs, nav_msgs, std_msgs, mavros)
+# come from your ROS 2 distro + apt/rosdep, not pip -- e.g.:
+#
+#   sudo apt install ros-<distro>-cv-bridge ros-<distro>-tf2-ros \
+#       ros-<distro>-mavros ros-<distro>-mavros-msgs
+#   rosdep install --from-paths src --ignore-src -r -y
+#
+# Install these with (remember --break-system-packages on Ubuntu 24+):
+#   pip install -r requirements.txt --break-system-packages
+
+numpy>=1.24,<2.0        # used throughout (filters, planner, aruco_detector); pinned <2.0 for cv_bridge/older ROS numpy ABI compatibility -- test before upgrading
+opencv-python>=4.8       # cv2: capture, solvePnP, image processing, debug windows (aruco_detector.py)
+pupil-apriltags>=1.0     # AprilTag 36h11 detection (aruco_detector.py)
+tf-transformations>=1.0  # quaternion/euler helpers (aruco_detector.py, relative_position_controller.py)
+PyQt5>=5.15              # cinematic_gui.py form + event loop
