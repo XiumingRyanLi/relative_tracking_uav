@@ -11,9 +11,11 @@ if not hasattr(np, "float"):
 from cv_bridge import CvBridge
 import tf2_ros
 import tf_transformations
+from pupil_apriltags import Detector as AprilTagDetector
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from sensor_msgs.msg import Image
 from std_msgs.msg import Bool
 from geometry_msgs.msg import TransformStamped
@@ -89,6 +91,17 @@ class ArUCoNode(Node):
         self.get_logger().info(f"Video recording parameters: save_frames={self.save_frames}, create_video={self.create_video}, video_fps={self.video_fps}")
         self.get_logger().info(f"Output directory: '{self.output_dir}' (empty means workspace root)")
 
+        # Decouples detection processing from frame arrival rate -- the
+        # subscription/webcam capture always stores the latest frame
+        # only, and this timer decides how often we actually run
+        # detection on whatever's newest. If processing ever takes
+        # longer than 1/processing_rate, we just skip straight to the
+        # next-newest frame instead of working through a backlog.
+        self.declare_parameter("processing_rate", 20.0)
+        self._processing_rate = float(
+            self.get_parameter("processing_rate").get_parameter_value().double_value
+        )
+
         # ---- CAMERA PARAMETERS ----
         # Must match the IR input size you exported (default IRIS is 640 x 480)
         self.declare_parameter("imgsz_width", 640)
@@ -97,7 +110,20 @@ class ArUCoNode(Node):
         self.declare_parameter("imgsz_height", 480)
         self._image_height = int(self.get_parameter("imgsz_height").get_parameter_value().integer_value)
 
-        self._camera_fov_horizontal = 2.0  # radians (≈114.6°) – tune for your camera
+        # 114.6 deg (the old value) is fisheye-territory and makes any
+        # tag at a normal shot distance unresolvably small in pixels --
+        # see the analysis behind this change: at ~4.2m slant distance
+        # (typical SHOT offset) with a 0.335m tag, 114.6 deg gave ~16px
+        # across an 8x8-module AprilTag, i.e. ~2px/module -- undecodable
+        # by any detector. ~50 deg gets that to a comfortable ~55px
+        # (~7px/module) at the same distance while still keeping a
+        # reasonably wide working field of view rather than tuning all
+        # the way down to the bare-minimum ~28 deg. Re-tune this against
+        # your actual planned shot distances/tag sizes -- this is a
+        # starting point, not a final calibrated value, and it MUST also
+        # match whatever FOV your camera sensor is actually configured
+        # with in the SDF, or this camera_matrix will be wrong.
+        self._camera_fov_horizontal = 0.87  # radians (≈50°) – tune for your camera
         self._camera_fov_vertical = 2 * np.arctan(np.tan(self._camera_fov_horizontal / 2) / (self._image_width/self._image_height))
 
         # Generate the camera matrix
@@ -122,10 +148,27 @@ class ArUCoNode(Node):
         self.min_marker_area_px = float(self.get_parameter("min_marker_area_px").value)
 
         # ---- TAG PARAMETERS ----
+        # NOTE: switched from ArUco (DICT_5X5_50) to AprilTag 36h11 for
+        # Thursday's test. The IDs/sizes/offsets below are carried over
+        # unchanged from the ArUco setup -- update them to match whatever
+        # AprilTag 36h11 tags you actually print/place. AprilTag 36h11 ID
+        # space goes well beyond 50, so 0/27/35 are still valid IDs, but
+        # they must be the *AprilTag* graphics with those IDs, not the
+        # old ArUco ones -- the bit patterns are different families.
+        # NOTE: tag id 0 scaled 5x in model.sdf (0.067m -> 0.335m) --
+        # update this if you scale it differently or scale a different
+        # tag. This MUST match the actual real-world size of the black
+        # tag pattern in the sim, or solvePnP's distance/pose output
+        # will be off by exactly that scale factor.
+        # Tag id 0: model.sdf applies <scale>6 6 1</scale> to april_tag.dae,
+        # whose black tag pattern is 0.067m at base scale -- so the real
+        # world size is 0.067 * 6 = 0.402m. Confirmed directly from
+        # model.sdf, not a guess -- update this if you change the scale
+        # or swap which tag is mounted.
         self._TAG_SIZES = {
                 35: 0.455,
                 27: 0.067,
-                0 : 0.067
+                0 : 0.402
             }
 
         self._TAG_POSITIONS = {
@@ -155,14 +198,48 @@ class ArUCoNode(Node):
         self._tf_cam_to_tag_broadcaster = tf2_ros.TransformBroadcaster(self)
         self._tf_tag_to_aruco_target_broadcaster = tf2_ros.TransformBroadcaster(self)
 
-        # ---- OPENCV ----
-        self._aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_5X5_50)
-        self._aruco_params = cv2.aruco.DetectorParameters()
-        # self.aruco_params.adaptiveThreshWinSizeMin = 3
-        # self.aruco_params.adaptiveThreshWinSizeMax = 23
-        # self.aruco_params.adaptiveThreshWinSizeStep = 10
-        self._aruco_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
-        self.detector = cv2.aruco.ArucoDetector(self._aruco_dict, self._aruco_params)
+        # ---- APRILTAG DETECTOR ----
+        # Dedicated apriltag C library via pupil_apriltags, instead of
+        # OpenCV's generic aruco-module AprilTag support. Detection only
+        # -- pose is still done with our own solvePnP below (not this
+        # library's built-in pose estimator), because that estimator
+        # assumes one uniform tag size and our tags aren't uniform
+        # (0.455m vs 0.067m). Everything downstream of detection is
+        # unchanged.
+        self.detector = AprilTagDetector(
+            families="tag36h11",
+            quad_decimate=1.0,
+            quad_sigma=0.0,
+            refine_edges=1,
+            decode_sharpening=0.75,
+            debug=0,
+        )
+
+        # ---- DIAGNOSTICS ----
+        # Logs one row per processing cycle -- hit AND miss -- so we can
+        # actually see the pattern behind intermittent detection instead
+        # of guessing from log lines that only fire on success. Look at
+        # raw_detections/best_decision_margin especially: if
+        # raw_detections is 0 on most misses, pupil_apriltags isn't even
+        # finding a candidate quad (points to occlusion/angle/blur/
+        # contrast, not a threshold tuning problem). If raw_detections
+        # is >0 but accepted=False, it's finding something and our own
+        # min_marker_area_px filter is rejecting it (a tuning fix, much
+        # easier to solve). If best_decision_margin is consistently low
+        # even when accepted, the tag is right at the edge of
+        # decodability (matches the pixel-resolution analysis from
+        # earlier -- distance/FOV/tag-size need more margin, not just
+        # "enough" margin).
+        diag_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        diag_dir = self.output_dir if self.output_dir else (get_workspace_root() or os.getcwd())
+        os.makedirs(diag_dir, exist_ok=True)
+        self._diag_csv_path = os.path.join(diag_dir, f"detection_diagnostics_{diag_timestamp}.csv")
+        self._diag_file = open(self._diag_csv_path, "w")
+        self._diag_file.write(
+            "wall_time,raw_detections,best_tag_id,best_decision_margin,"
+            "best_area_px,min_marker_area_px,accepted,solvepnp_success,distance_m\n"
+        )
+        self.get_logger().info(f"Per-frame detection diagnostics: {self._diag_csv_path}")
 
         # ---- INITIALISATION ----
         self.frame_count = 0
@@ -195,10 +272,31 @@ class ArUCoNode(Node):
         if self.show_debug_window:
             cv2.namedWindow("Detected Markers", cv2.WINDOW_AUTOSIZE)
 
+        # ---- IMAGE SOURCE SETUP ----
+        # Always hold at most one frame -- the newest one received/captured.
+        # The processing timer below consumes it and clears it, so a slow
+        # processing cycle skips straight to whatever's newest next time
+        # instead of working through a backlog of stale frames.
+        self._img_msg = None
+
+        # BEST_EFFORT + depth=1: never queue frames waiting to be
+        # processed. If detection falls behind the camera's publish
+        # rate, older frames are simply dropped instead of piling up --
+        # that backlog (with the previous default RELIABLE/depth=10
+        # subscription) is what was causing "barely detects" and
+        # effectively slow updates: we were working through increasingly
+        # stale queued frames rather than the live feed.
+        _img_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+
         # Image source
         if self.image_source == "topic":
             self.image_subscription = self.create_subscription(
-                Image, "/camera/image_raw", self.image_callback, 10
+                Image, "/camera/image_raw", self._image_store_callback, _img_qos
             )
             self.get_logger().info(
                 "ArUCoImageNode started in TOPIC mode, waiting for MAVROS altitude and image topic..."
@@ -244,12 +342,26 @@ class ArUCoNode(Node):
                     f"FPS={actual_fps}, Width={actual_width}, Height={actual_height}"
                 )
             self.timer = self.create_timer(
-                1.0 / 30.0, self.webcam_timer_callback
-            )  # 30 Hz
+                1.0 / 30.0, self._webcam_store_callback
+            )  # capture rate -- separate from processing_rate below
+
+        # Fires at processing_rate, independent of how fast frames are
+        # arriving/being captured -- always processes whatever is
+        # currently the newest stored frame, then clears it.
+        self._process_timer = self.create_timer(
+            1.0 / self._processing_rate, self._process_timer_callback
+        )
 
     # ---- CALLBACK IMPLEMENTATIONS ----
-    def webcam_timer_callback(self):
-        """Read image from webcam and publish to /image topic"""
+    def _image_store_callback(self, msg):
+        """Topic mode: just store the latest frame. Actual detection
+        happens on the processing timer, decoupled from arrival rate."""
+        self._img_msg = msg
+
+    def _webcam_store_callback(self):
+        """Webcam mode: grab one frame and store it as the latest. Actual
+        detection happens on the processing timer, decoupled from
+        capture rate."""
         if hasattr(self, "cap") and self.cap is not None and self.cap.isOpened():
             ret, frame = self.cap.read()
             if ret:
@@ -258,14 +370,24 @@ class ArUCoNode(Node):
                     frame, (self._image_width, self._image_height), interpolation=cv2.INTER_NEAREST
                 )
                 msg = self._bridge.cv2_to_imgmsg(frame, encoding="bgr8")
-
-                self.image_callback(msg)
+                self._img_msg = msg
             else:
                 self.get_logger().warning("Failed to read frame from webcam.")
         else:
             self.get_logger().warning("Webcam not opened.")
 
-    def image_callback(self, msg):
+    def _process_timer_callback(self):
+        """Fires at processing_rate. Consumes whichever frame is
+        currently newest (from either source mode) and clears it, so a
+        slow processing cycle skips straight to the next-newest frame
+        instead of working through a backlog."""
+        if self._img_msg is None:
+            return  # nothing new since the last cycle
+        msg = self._img_msg
+        self._img_msg = None
+        self.process_frame(msg)
+
+    def process_frame(self, msg):
         """Process image and detect tag, calculate pose and publish tf_transform"""
         frame = self._bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
 
@@ -290,35 +412,55 @@ class ArUCoNode(Node):
         if frame.shape[0] != self._image_height or frame.shape[1] != self._image_width:
             frame = cv2.resize(frame, (self._image_width, self._image_height), interpolation=cv2.INTER_LINEAR)
 
-        # Inference (ArUCo detection via OpenCV)
+        # Inference (AprilTag detection via pupil_apriltags)
         gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) # Change to greyscale before inference step
-        corners, ids, _ = self.detector.detectMarkers(gray_frame)
+        detections = self.detector.detect(gray_frame)
+
+        # Diagnostics: capture the best RAW detection (any tag ID, any
+        # size) before our own filtering, so a miss can be traced back
+        # to "pupil_apriltags found nothing" vs "found something but our
+        # filters rejected it."
+        diag = {
+            "raw_detections": len(detections),
+            "best_tag_id": "",
+            "best_decision_margin": "",
+            "best_area_px": "",
+            "accepted": False,
+            "solvepnp_success": False,
+            "distance_m": "",
+        }
+        if detections:
+            best_raw = max(detections, key=lambda d: d.decision_margin)
+            diag["best_tag_id"] = int(best_raw.tag_id)
+            diag["best_decision_margin"] = round(float(best_raw.decision_margin), 2)
+            diag["best_area_px"] = round(float(cv2.contourArea(best_raw.corners.astype(np.float32))), 1)
 
         # Keep only recognised markers and choose the largest recognised one.
-        # Previously, the code first checked that *some* recognised marker existed,
-        # then selected the largest marker from all detections. If an unknown marker
-        # was larger, object_points[tag_id] could fail or produce the wrong pose.
         valid_markers = []
-        if ids is not None:
-            for i, tag_id_arr in enumerate(ids):
-                tag_id = int(tag_id_arr[0])
-                if tag_id not in self._object_points:
-                    continue
+        for d in detections:
+            tag_id = int(d.tag_id)
+            if tag_id not in self._object_points:
+                continue
 
-                area = cv2.contourArea(corners[i][0].astype(np.float32))
-                if area < self.min_marker_area_px:
-                    continue
+            area = cv2.contourArea(d.corners.astype(np.float32))
+            if area < self.min_marker_area_px:
+                continue
 
-                valid_markers.append((area, i, tag_id))
+            valid_markers.append((area, d, tag_id))
+
+        diag["accepted"] = len(valid_markers) > 0
 
         aruco_target_found = len(valid_markers) > 0
         self._aruco_target_found_publisher.publish(Bool(data=aruco_target_found))
 
         # If a recognised tag is visible, execute pose calculations.
         if aruco_target_found:
-            area, idx, tag_id = max(valid_markers, key=lambda item: item[0])
+            area, best, tag_id = max(valid_markers, key=lambda item: item[0])
 
-            image_points = corners[idx][0].astype(np.float32)
+            # pupil_apriltags returns corners in a different order than
+            # our object_points [top-left, top-right, bottom-right,
+            # bottom-left] convention -- reorder to match.
+            image_points = best.corners[[1, 0, 3, 2]].astype(np.float32)
             object_points = self._object_points[tag_id]
 
             success, rvec, tvec = cv2.solvePnP(
@@ -336,6 +478,8 @@ class ArUCoNode(Node):
             )
 
             if success:
+                diag["solvepnp_success"] = True
+
                 # Draw pose axes for debugging
                 if self.show_debug_window:
                     cv2.drawFrameAxes(
@@ -360,15 +504,39 @@ class ArUCoNode(Node):
 
                         p = aruco_target_odom_msg.pose.pose.position
                         target_distance = float(np.sqrt(p.x * p.x + p.y * p.y + p.z * p.z))
+                        diag["distance_m"] = round(target_distance, 2)
                         self.get_logger().info(
                             f"ArUco target distance={target_distance:.2f} m, "
                             f"camera_position=({p.x:.2f}, {p.y:.2f}, {p.z:.2f})",
                             throttle_duration_sec=0.5,
                         )
 
-        # Show the output image after ArUCo detection (if debug window enabled)
+        # Write one diagnostic row per cycle regardless of hit/miss --
+        # this is what lets us see the actual failure pattern instead of
+        # guessing from log lines that only fire on success.
+        self._diag_file.write(
+            f"{self.get_clock().now().nanoseconds / 1e9:.3f},"
+            f"{diag['raw_detections']},{diag['best_tag_id']},{diag['best_decision_margin']},"
+            f"{diag['best_area_px']},{self.min_marker_area_px},{diag['accepted']},"
+            f"{diag['solvepnp_success']},{diag['distance_m']}\n"
+        )
+        self._diag_file.flush()
+
+        # Show the output image after AprilTag detection (if debug window enabled)
         if self.show_debug_window:
-            cv2.aruco.drawDetectedMarkers(frame, corners, ids)
+            for d in detections:
+                pts = d.corners.astype(np.int32)
+                colour = (0, 255, 0) if int(d.tag_id) in self._object_points else (0, 165, 255)
+                cv2.polylines(frame, [pts], isClosed=True, color=colour, thickness=2)
+                cv2.putText(
+                    frame,
+                    str(d.tag_id),
+                    (int(d.center[0]), int(d.center[1])),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 0, 255),
+                    2,
+                )
             cv2.imshow('Detected Markers', frame)
             cv2.waitKey(1)
 
@@ -590,6 +758,13 @@ def main(args=None):
         node.get_logger().info("Keyboard interrupt received. Shutting down...")
 
     finally:
+        if hasattr(node, "_diag_file") and node._diag_file is not None:
+            try:
+                node._diag_file.close()
+                node.get_logger().info(f"Diagnostics saved to: {node._diag_csv_path}")
+            except Exception:
+                pass
+
         if hasattr(node, "cap") and node.cap is not None:
             node.cap.release()
 

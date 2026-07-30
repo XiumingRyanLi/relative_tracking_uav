@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import math
 import csv
+import json
 from datetime import datetime
 from turtle import stamp
 
@@ -8,7 +9,12 @@ try:
     from .cinematic_planner import CinematicPlanner
 except ImportError:
     from cinematic_planner import CinematicPlanner
-    
+
+try:
+    from .cinematic_action_schema import validate_action
+except ImportError:
+    from cinematic_action_schema import validate_action
+
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
@@ -19,7 +25,7 @@ from geometry_msgs.msg import PoseStamped, TwistStamped
 from nav_msgs.msg import Odometry
 from mavros_msgs.msg import State
 from mavros_msgs.srv import CommandBool, CommandTOL, SetMode
-from std_msgs.msg import Float64, Bool
+from std_msgs.msg import Float64, Bool, String
 try:
     from .pid_controller import PIDRelativeController
     from .gimbal_controller import GimbalController
@@ -93,15 +99,6 @@ class RelativePositionController(Node):
 
         # Target heading/yaw-rate estimation. A CTRV UKF (separate from
         # the translational CV KF below) filters heading and yaw rate.
-        # enable_visual_heading_filter, max_visual_heading_distance and
-        # max_visual_heading_jump_deg gate the UKF's heading updates
-        # (i.e. whether a given frame's heading measurement is trusted).
-        # enable_heading_ukf is a separate, full kill switch for the UKF
-        # itself -- set False to bypass it entirely and fall back to the
-        # old behaviour (raw, unfiltered per-frame heading), e.g. for A/B
-        # testing filtered vs. unfiltered heading on the bench or in sim.
-        # visual_heading_alpha is superseded by the UKF's own
-        # process-noise tuning and is no longer used.
         self.declare_parameter("visual_heading_alpha", 0.25)
         self.declare_parameter("max_visual_heading_jump_deg", 60.0)
         self.declare_parameter("max_visual_heading_distance", 5.0)
@@ -260,6 +257,10 @@ class RelativePositionController(Node):
             [0.0, 1.0, 0.0],
         ])
 
+        #---------------- Gui ----------------
+        self.declare_parameter("cinematic_command_topic", "/cinematic_command")
+        self.cinematic_command_topic = self.get_parameter("cinematic_command_topic").value
+
         # ---------------- Pure controllers ----------------
         self.pid = PIDRelativeController(dt=0.15)
         self.gimbal = GimbalController()
@@ -316,6 +317,11 @@ class RelativePositionController(Node):
             "/mavros/gimbal_control/device/attitude_status",
             self._on_gimbal_attitude_status,
             10
+        )
+
+        
+        self.cinematic_command_sub = self.create_subscription(
+            String, self.cinematic_command_topic, self._on_cinematic_command, reliable_qos
         )
 
         # ---------------- Publishers ----------------
@@ -521,6 +527,48 @@ class RelativePositionController(Node):
             self.last_visual_camera_time is not None
             and (now - self.last_visual_camera_time) <= self.target_timeout_sec
         )
+    
+    def _on_cinematic_command(self, msg: String):
+        try:
+            raw_actions = json.loads(msg.data)
+        except (json.JSONDecodeError, TypeError) as exc:
+            self.get_logger().error(f"Cinematic command: invalid JSON ({exc}); ignoring.")
+            return
+ 
+        if not isinstance(raw_actions, list) or not raw_actions:
+            self.get_logger().error(
+                "Cinematic command: expected a non-empty JSON list of actions; ignoring."
+            )
+            return
+ 
+        # Planner-derived defaults (used when a field is missing/invalid),
+        # so a bare hold_location falls back to the drone's actual current
+        # default shot rather than a generic constant.
+        dynamic_defaults = {
+            "radius": self.cinematic_planner.default_radius,
+            "height": self.cinematic_planner.default_height,
+            "start_height": self.cinematic_planner.default_height,
+            "peak_height": self.cinematic_planner.default_height + 3.0,
+            "end_height": self.cinematic_planner.default_height,
+        }
+
+        validated = []
+        for i, raw in enumerate(raw_actions):
+            action = validate_action(raw, i, dynamic_defaults, warn=self.get_logger().warn)
+            if action is not None:
+                validated.append(action)
+ 
+        if not validated:
+            self.get_logger().error(
+                "Cinematic command: no valid actions after validation; sequence not applied."
+            )
+            return
+ 
+        self.cinematic_planner.set_sequence(validated)
+        self.get_logger().info(
+            f"Cinematic command: applied new sequence with {len(validated)} action(s)."
+        )
+
 
     # ------------------------------------------------------------------
     # Callbacks

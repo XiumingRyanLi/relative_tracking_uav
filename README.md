@@ -65,7 +65,7 @@ Each application will need to be run in separate terminal windows.
 ```bash
 export GZ_SIM_SYSTEM_PLUGIN_PATH=$HOME/{PATH_TO_INSTALL}/ardupilot_gazebo/build:$GZ_SIM_SYSTEM_PLUGIN_PATH
 cd worlds
-gz sim iris_runway.sdf -v -r
+# gz sim iris_runway.sdf -v -r
 
 gz sim iris_runway_new.sdf -v -r
 
@@ -79,16 +79,16 @@ ros2 run ros_gz_bridge parameter_bridge /world/iris_runway/model/iris_with_gimba
 
 Final bridge
 ```bash
-ros2 run ros_gz_bridge parameter_bridge \
-/world/iris_runway_new/model/iris_with_gimbal/model/gimbal/link/pitch_link/sensor/camera/image@sensor_msgs/msg/Image[gz.msgs.Image \
-/model/LandingVehicle/odometry@nav_msgs/msg/Odometry[gz.msgs.Odometry \
-/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock \
-/gimbal/cmd_roll@std_msgs/msg/Float64]gz.msgs.Double \
-/gimbal/cmd_pitch@std_msgs/msg/Float64]gz.msgs.Double \
-/gimbal/cmd_yaw@std_msgs/msg/Float64]gz.msgs.Double \
---ros-args \
--r /world/iris_runway_new/model/iris_with_gimbal/model/gimbal/link/pitch_link/sensor/camera/image:=/camera/image_raw \
--r /model/LandingVehicle/odometry:=/aruco_target/odom
+# ros2 run ros_gz_bridge parameter_bridge \
+# /world/iris_runway_new/model/iris_with_gimbal/model/gimbal/link/pitch_link/sensor/camera/image@sensor_msgs/msg/Image[gz.msgs.Image \
+# /model/LandingVehicle/odometry@nav_msgs/msg/Odometry[gz.msgs.Odometry \
+# /clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock \
+# /gimbal/cmd_roll@std_msgs/msg/Float64]gz.msgs.Double \
+# /gimbal/cmd_pitch@std_msgs/msg/Float64]gz.msgs.Double \
+# /gimbal/cmd_yaw@std_msgs/msg/Float64]gz.msgs.Double \
+# --ros-args \
+# -r /world/iris_runway_new/model/iris_with_gimbal/model/gimbal/link/pitch_link/sensor/camera/image:=/camera/image_raw \
+# -r /model/LandingVehicle/odometry:=/aruco_target/odom
 ```
 
 ```bash
@@ -102,12 +102,10 @@ ros2 run ros_gz_bridge parameter_bridge \
 ### Run ArduPilot
 
 ```bash
-cd ~/ardupilot && sim_vehicle.py -v ArduCopter --console --map -w --out=udp:127.0.0.1:14555 -f gazebo-iris --model JSON
+# cd ~/ardupilot && sim_vehicle.py -v ArduCopter --console --map -w --out=udp:127.0.0.1:14555 -f gazebo-iris --model JSON
 
-cd ~/ardupilot && sim_vehicle.py -D -v ArduCopter -f JSON \
---add-param-file=$HOME/ardupilot_gazebo/config/gazebo-iris-gimbal.parm \
---console --map \
---out=udp:127.0.0.1:14555
+cd ~/ardupilot && sim_vehicle.py -D -v ArduCopter -f JSON --add-param-file=$HOME/ardupilot_gazebo/config/gazebo-iris-gimbal.parm --console --map --out=udp:127.0.0.1:14555
+
 ```
 
 ### Run MAVROS
@@ -116,25 +114,32 @@ cd ~/ardupilot && sim_vehicle.py -D -v ArduCopter -f JSON \
 ros2 run mavros mavros_node --ros-args -p fcu_url:=udp://:14555@
 ```
 
-### Run YOLO Perception
+### Run Aruco Detection Perception
 
 ```bash
 source install/setup.bash
-ros2 run circumnavigation_controller bearing_measurement_generation
+ros2 run circumnavigation_controller aruco_detector 
 ```
 
-### Run Circumnavigation Controller
+### Run relative position Controller
 
 ```bash
 source install/setup.bash
-ros2 run circumnavigation_controller controller
+# ros2 run circumnavigation_controller controller
 
 ros2 run circumnavigation_controller relative_position_controller
 ```
 
+### Launch the Gui
+```bash
+ros2 run circumnavigation_controller cinematic_gui
+
+```
+
+
 ### Controlling the Rover
 ```bash
-gz topic -t "/cmd_rover_vel" -m gz.msgs.Twist -p "linear: {x: 0.6}, angular: {z: 1.0}"
+# gz topic -t "/cmd_rover_vel" -m gz.msgs.Twist -p "linear: {x: 0.6}, angular: {z: 1.0}"
 
 gz topic -t /cmd_vel -m gz.msgs.Twist -p "linear: {x:1.0}, angular: {z: 0.0}"
 

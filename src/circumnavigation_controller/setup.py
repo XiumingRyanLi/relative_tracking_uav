@@ -28,7 +28,8 @@ setup(
             'controller = circumnavigation_controller.controller:main',
             'relative_position_controller = circumnavigation_controller.relative_position_controller:main',
             'camera_calibrate = circumnavigation_controller.camera_calibrate:main',
-            'aruco_detector = circumnavigation_controller.aruco_detector:main'
+            'aruco_detector = circumnavigation_controller.aruco_detector:main',
+            'cinematic_gui = circumnavigation_controller.cinematic_gui:main'
         ],
     },
 )
