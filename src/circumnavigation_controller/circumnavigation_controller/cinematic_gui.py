@@ -18,6 +18,7 @@ Run:
 """
 import sys
 import json
+import signal
 
 import rclpy
 from rclpy.node import Node
@@ -204,15 +205,28 @@ def main(args=None):
     window = CinematicWindow(ros_node)
     window.show()
 
+    # PyQt installs its own SIGINT handler that just gets ignored while the
+    # C++ event loop is running, so Ctrl+C normally does nothing. Restore
+    # Python's default handler so SIGINT actually raises KeyboardInterrupt --
+    # but that interrupt can still only be delivered when the interpreter
+    # gets a chance to run, which the spin_timer below provides every 50ms.
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+
     # Pump rclpy alongside the Qt event loop so the publisher/params stay
-    # healthy without blocking the GUI thread.
+    # healthy without blocking the GUI thread. This timer firing every
+    # 50ms is also what lets Python notice a pending SIGINT and act on it --
+    # without some periodic callback, the interpreter never regains control
+    # long enough to process the signal at all.
     spin_timer = QTimer()
     spin_timer.timeout.connect(lambda: rclpy.spin_once(ros_node, timeout_sec=0.0))
     spin_timer.start(50)
 
     try:
         app.exec_()
+    except KeyboardInterrupt:
+        ros_node.get_logger().info("Ctrl+C received, shutting down.")
     finally:
+        app.quit()
         ros_node.destroy_node()
         rclpy.shutdown()
 

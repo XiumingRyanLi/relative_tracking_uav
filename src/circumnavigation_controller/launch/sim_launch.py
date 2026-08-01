@@ -34,7 +34,7 @@ WORLD_NAME = 'iris_runway_new'  # must match whatever <world name="..."> is in t
 # booting" from the launch system's point of view - so give it a head start.
 # Bump this up if you see MAVROS repeatedly failing to connect (e.g. FCU
 # heartbeat never appears in `ros2 topic echo /mavros/state`).
-ARDUPILOT_STARTUP_DELAY_SEC = 25.0
+ARDUPILOT_STARTUP_DELAY_SEC = 35.0
 
 
 def generate_launch_description():

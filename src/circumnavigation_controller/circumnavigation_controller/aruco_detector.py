@@ -166,15 +166,15 @@ class ArUCoNode(Node):
         # model.sdf, not a guess -- update this if you change the scale
         # or swap which tag is mounted.
         self._TAG_SIZES = {
-                35: 0.455,
-                27: 0.067,
-                0 : 0.402
-            }
+            35: 0.455,
+            27: 0.067,
+            0 : 0.067
+        }
 
         self._TAG_POSITIONS = {
             35: [0.0, 0.3100, 0.0], #x, y, z
             27: [0.0, 0.0000, 0.0],
-            0 : [0.0, 0.6200, 0.0]
+            0 : [0.0, 0.0000, 0.0]
         }
 
         self._object_points = {}
