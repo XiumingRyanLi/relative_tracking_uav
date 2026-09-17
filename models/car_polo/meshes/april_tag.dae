@@ -1,0 +1,165 @@
+<?xml version="1.0" encoding="utf-8"?>
+<COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema" version="1.4.1">
+  <asset>
+    <!-- Built directly in meters  - no SketchUp inches-to-meters
+         conversion needed for this one, unlike the Polo mesh. -->
+    <unit meter="1.0" name="meter" />
+    <up_axis>Z_UP</up_axis>
+  </asset>
+
+  <!-- ================= IMAGE =================
+       Path is just the filename  - place apriltag_36h11_id0.png in the
+       same directory as this .dae (or update this path to wherever you
+       keep it, e.g. "../materials/textures/apriltag_36h11_id0.png" if
+       you're following the usual Gazebo model folder layout). -->
+  <library_images>
+    <image id="apriltag_id0_image" name="apriltag_id0_image">
+      <init_from>apriltag_36h11_id0.png</init_from>
+    </image>
+  </library_images>
+
+  <!-- ================= EFFECT / MATERIAL ================= -->
+  <library_effects>
+    <effect id="apriltag_id0_effect">
+      <profile_COMMON>
+        <newparam sid="apriltag_id0_surface">
+          <surface type="2D">
+            <init_from>apriltag_id0_image</init_from>
+          </surface>
+        </newparam>
+        <newparam sid="apriltag_id0_sampler">
+          <sampler2D>
+            <source>apriltag_id0_surface</source>
+          </sampler2D>
+        </newparam>
+        <technique sid="common">
+          <lambert>
+            <emission>
+              <!-- Emissive so the tag reads cleanly regardless of
+                   scene lighting/shadowing  - drop this to <color>0 0
+                   0 1</color> if you want it lit normally instead. -->
+              <texture texture="apriltag_id0_sampler" texcoord="TEXCOORD0" />
+            </emission>
+            <diffuse>
+              <texture texture="apriltag_id0_sampler" texcoord="TEXCOORD0" />
+            </diffuse>
+          </lambert>
+        </technique>
+      </profile_COMMON>
+    </effect>
+  </library_effects>
+
+  <library_materials>
+    <material id="apriltag_id0_material" name="apriltag_id0_material">
+      <instance_effect url="#apriltag_id0_effect" />
+    </material>
+  </library_materials>
+
+  <!-- ================= GEOMETRY =================
+       Flat quad in the XY plane, 0.0938m x 0.0938m TOTAL  - this is
+       bigger than the 0.067m tag size in _TAG_SIZES because the
+       texture now includes a white quiet-zone margin around the black
+       tag pattern (required for reliable detection  - without it the
+       black border has nothing to contrast against and detection
+       becomes marginal/inconsistent). The black tag pattern itself
+       still occupies exactly 0.067m x 0.067m in the center of this
+       plane (1000px of the 1400px composite texture), matching what
+       solvePnP's object_points in aruco_detector.py assume. Centered
+       at the origin, facing +Z. -->
+  <library_geometries>
+    <geometry id="april_tag_geometry" name="april_tag">
+      <mesh>
+        <source id="april_tag_positions">
+          <float_array id="april_tag_positions_array" count="12">
+            -0.0469 -0.0469 0.0
+             0.0469 -0.0469 0.0
+             0.0469  0.0469 0.0
+            -0.0469  0.0469 0.0
+          </float_array>
+          <technique_common>
+            <accessor source="#april_tag_positions_array" count="4" stride="3">
+              <param name="X" type="float" />
+              <param name="Y" type="float" />
+              <param name="Z" type="float" />
+            </accessor>
+          </technique_common>
+        </source>
+
+        <source id="april_tag_normals">
+          <float_array id="april_tag_normals_array" count="3">
+            0.0 0.0 1.0
+          </float_array>
+          <technique_common>
+            <accessor source="#april_tag_normals_array" count="1" stride="3">
+              <param name="X" type="float" />
+              <param name="Y" type="float" />
+              <param name="Z" type="float" />
+            </accessor>
+          </technique_common>
+        </source>
+
+        <!-- UV mapping: V is flipped (top-left vertex -> v=1) so the
+             tag image renders right-side-up under the common
+             bottom-left-origin texture convention. If it comes out
+             upside-down or mirrored in Gazebo, swap the V values
+             (0.0<->1.0) or U values below  - renderer conventions
+             differ and this is the one thing I can't verify without
+             seeing it rendered on your end. -->
+        <source id="april_tag_uvs">
+          <float_array id="april_tag_uvs_array" count="8">
+            0.0 0.0
+            1.0 0.0
+            1.0 1.0
+            0.0 1.0
+          </float_array>
+          <technique_common>
+            <accessor source="#april_tag_uvs_array" count="4" stride="2">
+              <param name="S" type="float" />
+              <param name="T" type="float" />
+            </accessor>
+          </technique_common>
+        </source>
+
+        <vertices id="april_tag_vertices">
+          <input semantic="POSITION" source="#april_tag_positions" />
+        </vertices>
+
+        <!-- Two triangles, wound CCW when viewed from +Z (matches the
+             +Z normal above)  - if the tag doesn't render/disappears
+             from the camera's viewing angle, backface culling is
+             likely why; reverse the winding order (swap the 2nd/3rd
+             index in each triangle) or make it double-sided. -->
+        <triangles material="apriltag_id0_symbol" count="2">
+          <input semantic="VERTEX" source="#april_tag_vertices" offset="0" />
+          <input semantic="NORMAL" source="#april_tag_normals" offset="1" />
+          <input semantic="TEXCOORD" source="#april_tag_uvs" offset="2" set="0" />
+          <p>
+            0 0 0  1 0 1  2 0 2
+            0 0 0  2 0 2  3 0 3
+          </p>
+        </triangles>
+      </mesh>
+    </geometry>
+  </library_geometries>
+
+  <!-- ================= SCENE ================= -->
+  <library_visual_scenes>
+    <visual_scene id="april_tag_scene" name="april_tag_scene">
+      <node id="april_tag_node" name="april_tag">
+        <instance_geometry url="#april_tag_geometry">
+          <bind_material>
+            <technique_common>
+              <instance_material symbol="apriltag_id0_symbol" target="#apriltag_id0_material">
+                <bind_vertex_input semantic="TEXCOORD0" input_semantic="TEXCOORD" input_set="0" />
+              </instance_material>
+            </technique_common>
+          </bind_material>
+        </instance_geometry>
+      </node>
+    </visual_scene>
+  </library_visual_scenes>
+
+  <scene>
+    <instance_visual_scene url="#april_tag_scene" />
+  </scene>
+</COLLADA>
