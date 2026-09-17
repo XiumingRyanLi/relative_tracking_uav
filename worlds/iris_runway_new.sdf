@@ -66,16 +66,16 @@
       <pose degrees="true">0 0 0.195 0 0 90</pose>
     </include>
 
-    <include>
+    <!-- <include>
       <uri>model://X1</uri>
       <name>LandingVehicle</name>
-      <pose degrees="true">0 10 0.195 0 0 90</pose>
-    </include>
+      <pose degrees="true">0 3 0.195 0 0 90</pose>
+    </include> -->
     
     <include>
-      <uri>model://camera_calibrate_wall</uri>
-      <name>Wall</name>
-      <pose degrees="true">0 -5 0 0 0 0</pose>
+      <uri>model://car_polo</uri>
+      <name>LandingVehicle</name>
+      <pose degrees="true">0 6 0.15 0 0 90</pose>
     </include>
 
   </world>
