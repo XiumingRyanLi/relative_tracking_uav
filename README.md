@@ -122,3 +122,25 @@ ros2 run circumnavigation_controller controller
 
 ros2 run circumnavigation_controller relative_position_controller
 ```
+
+SITL param change:
+```bash
+  param set ATC_RAT_RLL_D 0.002
+
+  param set ATC_RAT_PIT_D 0.002
+
+  param set ATC_RAT_RLL_FLTD 10
+
+  param set ATC_RAT_PIT_FLTD 10 
+
+  param set ATC_RAT_RLL_P 0.10
+
+  param set ATC_RAT_PIT_P 0.10
+
+  param set ATC_INPUT_TC 0.20
+
+  param set INS_GYRO_FILTER 15
+
+  reboot
+  ```
+ 
