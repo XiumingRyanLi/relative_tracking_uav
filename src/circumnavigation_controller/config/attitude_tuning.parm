@@ -1,0 +1,20 @@
+# ArduCopter attitude-rate / gyro-filter tuning for the sim iris.
+#
+# Purpose: the stock gazebo-iris gains produce a small, fast roll/pitch
+# twitch (visible as vibration in the gimbal camera feed and as jitter in the
+# visual target track). Lower rate D-terms, lower D-term filter cut-offs, a
+# softer rate P, a slower attitude input time constant and a lower gyro
+# low-pass all calm that down.
+#
+# Loaded at SITL start by sim_launch.py via --add-param-file (after
+# copter.parm, gazebo-iris.parm and the gimbal file, so these values win).
+# No reboot needed; parameters are applied before the vehicle boots.
+
+ATC_RAT_RLL_D      0.002
+ATC_RAT_PIT_D      0.002
+ATC_RAT_RLL_FLTD   10
+ATC_RAT_PIT_FLTD   10
+ATC_RAT_RLL_P      0.10
+ATC_RAT_PIT_P      0.10
+ATC_INPUT_TC       0.20
+INS_GYRO_FILTER    15

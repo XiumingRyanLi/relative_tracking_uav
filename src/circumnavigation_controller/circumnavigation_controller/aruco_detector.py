@@ -123,7 +123,10 @@ class ArUCoNode(Node):
         # starting point, not a final calibrated value, and it MUST also
         # match whatever FOV your camera sensor is actually configured
         # with in the SDF, or this camera_matrix will be wrong.
-        self._camera_fov_horizontal = 0.87  # radians (≈50°) – tune for your camera
+        # Exposed as a ROS parameter so the launch file can pin it to the SDF
+        # value (worlds/iris_with_gimbal camera_link: 0.8 rad, 1280x720).
+        self.declare_parameter("camera_fov_horizontal", 0.87)
+        self._camera_fov_horizontal = float(self.get_parameter("camera_fov_horizontal").value)  # radians
         self._camera_fov_vertical = 2 * np.arctan(np.tan(self._camera_fov_horizontal / 2) / (self._image_width/self._image_height))
 
         # Generate the camera matrix

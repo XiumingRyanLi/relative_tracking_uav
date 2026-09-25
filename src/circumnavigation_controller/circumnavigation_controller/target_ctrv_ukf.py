@@ -94,7 +94,11 @@ class TargetCTRVUKF:
 
         self.max_yaw_rate = float(max_yaw_rate)
 
-        self.lambda_ = 3.0 - self.n_aug
+        # The textbook choice lambda = 3 - n_aug (= -4 here) gives the centre
+        # sigma point a negative weight, which can make P lose positive
+        # definiteness and crash the Cholesky (seen with DOPE-level noise).
+        # lambda = 0 keeps every weight positive.
+        self.lambda_ = 0.0
         n_sig = 2 * self.n_aug + 1
         self.weights = np.full(n_sig, 1.0 / (2.0 * (self.lambda_ + self.n_aug)))
         self.weights[0] = self.lambda_ / (self.lambda_ + self.n_aug)
@@ -133,7 +137,13 @@ class TargetCTRVUKF:
 
         # symmetrize + tiny jitter for numerical stability before cholesky
         P_aug = 0.5 * (P_aug + P_aug.T) + np.eye(self.n_aug) * 1e-9
-        L = np.linalg.cholesky(P_aug)
+        try:
+            L = np.linalg.cholesky(P_aug)
+        except np.linalg.LinAlgError:
+            # Clip negative eigenvalues rather than crash the controller.
+            w, V = np.linalg.eigh(P_aug)
+            P_aug = (V * np.maximum(w, 1e-9)) @ V.T
+            L = np.linalg.cholesky(0.5 * (P_aug + P_aug.T))
 
         n_sig = 2 * self.n_aug + 1
         Xsig_aug = np.zeros((self.n_aug, n_sig), dtype=float)
@@ -276,6 +286,7 @@ class TargetCTRVUKF:
         self.x = self.x + K @ z_diff
         self.x[3] = _wrap_to_pi(self.x[3])
         self.P = self.P - K @ S @ K.T
+        self.P = 0.5 * (self.P + self.P.T)
 
     # ------------------------------------------------------------
     # Accessors

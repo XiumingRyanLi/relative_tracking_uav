@@ -24,17 +24,29 @@ class GimbalController:
         world-frame pointing using drone pose and target local pose.
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        kp_yaw: float = 0.4,
+        kd_yaw: float = 0.0,
+        yaw_deadband_deg: float = 0.5,
+        max_yaw_step_deg: float = 8.0,
+    ):
         # Gimbal command limits, radians.
         self.max_pitch_up = math.radians(30.0)
         self.max_pitch_down = math.radians(-80.0)
         self.max_yaw = math.radians(90.0)
 
-        # Image-space PD gains.
-        self.kp_yaw = 0.5
-        self.kd_yaw = 0.08
+        # Image-space PD gains. Yaw is softer than pitch: the drone body also
+        # turns to face the target, so both loops correct the same bearing
+        # error, and the D term mostly amplified detection noise (jitter).
+        self.kp_yaw = kp_yaw
+        self.kd_yaw = kd_yaw
         self.kp_pitch = 0.5
         self.kd_pitch = 0.08
+        # Yaw jitter guards: ignore errors within the deadband (target already
+        # centred) and limit how far one command can move the yaw.
+        self.yaw_deadband = math.radians(yaw_deadband_deg)
+        self.max_yaw_step = math.radians(max_yaw_step_deg)
 
         # Sign corrections.
         # Flip these if the gimbal moves the wrong way.
@@ -94,7 +106,10 @@ class GimbalController:
             yaw_error_rate = self.wrap_to_pi(yaw_error - self.prev_yaw_error) / dt
             pitch_error_rate = (pitch_error - self.prev_pitch_error) / dt
 
-        yaw_correction = self.kp_yaw * yaw_error + self.kd_yaw * yaw_error_rate
+        yaw_correction = 0.0
+        if abs(yaw_error) > self.yaw_deadband:
+            yaw_correction = self.kp_yaw * yaw_error + self.kd_yaw * yaw_error_rate
+            yaw_correction = self.clamp(yaw_correction, -self.max_yaw_step, self.max_yaw_step)
         pitch_correction = self.kp_pitch * pitch_error + self.kd_pitch * pitch_error_rate
 
         cmd_yaw = current_yaw + self.yaw_sign * yaw_correction

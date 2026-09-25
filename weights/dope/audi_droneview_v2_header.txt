@@ -1,0 +1,2 @@
+Namespace(data=['/home/drones/data/AudiDroneView_all'], use_s3=False, train_buckets=[], endpoint=None, object=['Audi'], workers=8, batchsize=32, imagesize=448, lr=0.0001, net_path='/home/drones/Desktop/ryan/Deep_Object_Pose/train/output/weights_droneview_v1/net_epoch_0650.pth', namefile='epoch', manualseed=None, epochs=750, loginterval=100, outf='/home/drones/Desktop/ryan/Deep_Object_Pose/train/output/weights_droneview_v2', nb_checkpoints=0, save_every=25, sigma=4, local_rank=0, save=False)
+seed: 4918

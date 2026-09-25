@@ -2,3 +2,6 @@ build/
 install/
 log/
 *.csv
+*.pth
+__pycache__/
+*.pyc

@@ -62,7 +62,10 @@
     </include>
 
     <include>
-      <uri>model://iris_with_gimbal</uri>
+      <!-- Iris + real 3-axis gimbal (repo models/iris_with_dope_gimbal).
+           Named iris_with_gimbal so gz topics keep that model name. -->
+      <uri>model://iris_with_dope_gimbal</uri>
+      <name>iris_with_gimbal</name>
       <pose degrees="true">0 0 0.195 0 0 90</pose>
     </include>
 
@@ -73,7 +76,7 @@
     </include> -->
     
     <include>
-      <uri>model://car_polo</uri>
+      <uri>model://audi_r8</uri>
       <name>LandingVehicle</name>
       <pose degrees="true">0 6 0.15 0 0 90</pose>
     </include>

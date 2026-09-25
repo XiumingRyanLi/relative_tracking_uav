@@ -12,7 +12,13 @@ setup(
         ('share/' + package_name, ['package.xml']),
         ('share/' + package_name + '/launch', [
             'launch/sim_launch.py',
+            'launch/sim_dope_launch.py',
             'launch/webcam_launch.py',
+        ]),
+        ('share/' + package_name + '/config', [
+            'config/attitude_tuning.parm',
+            'config/gimbal_startup.parm',
+            'config/guided_limits.parm',
         ]),
     ],
     install_requires=['setuptools'],
@@ -29,6 +35,7 @@ setup(
             'relative_position_controller = circumnavigation_controller.relative_position_controller:main',
             'camera_calibrate = circumnavigation_controller.camera_calibrate:main',
             'aruco_detector = circumnavigation_controller.aruco_detector:main',
+            'dope_detector = circumnavigation_controller.dope_detector:main',
             'cinematic_gui = circumnavigation_controller.cinematic_gui:main'
         ],
     },

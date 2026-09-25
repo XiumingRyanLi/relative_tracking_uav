@@ -1,0 +1,28 @@
+# ArduCopter guided-mode speed/acceleration/jerk limits for car tracking.
+#
+# GUIDED velocity control (what relative_position_controller sends via
+# /mavros/setpoint_velocity/cmd_vel) takes its horizontal limits from the
+# waypoint-navigation parameters (ModeGuided::pva_control_start):
+#   WP_SPD  default 10 m/s
+#   WP_ACC  default 2.5 m/s^2
+#
+# With the default hold_location shot (18 m to the side), a car turning at
+# ~16 deg/s at 5 m/s moves the shot point at ~10 m/s on a ~36 m circle, which
+# needs ~2.9 m/s^2 just to stay on the curve: more than the defaults allow,
+# so the drone fell 30-70 m behind (run 20260924_151933, t >= 370 s).
+#
+# WP_ACC 5 stays inside what the default 30 deg lean limit (ATC_ANGLE_MAX) can
+# give: 9.81 * tan(30 deg) = 5.7 m/s^2. Keep pid_max_speed_xy <= WP_SPD and
+# pid_max_accel_xy == WP_ACC in relative_position_controller.
+#
+# PSC_NE_JERK is left at its default (5 m/s^3). Raising it to 20 (run
+# 20260924_161755) did not shorten the ~1.2 s command->velocity delay, which is
+# mostly the vehicle following its own target (attitude/velocity loops), and it
+# removed smoothing that damped the position loop: the drone then oscillated
+# +-6 m sideways even with the car parked.
+#
+# If a change here seems to have no effect, SITL is using a value saved in
+# ~/ardupilot/eeprom.bin: start sim_vehicle.py once with -w to wipe it.
+
+WP_SPD       15
+WP_ACC       5

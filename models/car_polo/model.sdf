@@ -74,11 +74,11 @@
                  alignment in Gazebo.
                  ======================================================== -->
             <visual name="aruco_marker_visual">
-                <pose>-1.7 0.6 1.03 0 0 -1.5707963267948966</pose>
+                <pose>-1.8 0.6 1.03 0 0 -1.5707963267948966</pose>
                 <geometry>
                     <mesh>
-                        <uri>model://car_polo/meshes/april_tag.dae</uri>
-                        <scale>6 6 1</scale> 
+                        <uri>model://car_polo/meshes/LandingTargetTemplate.dae</uri>
+                        <scale>1.2 1.2 1.2</scale> 
                     </mesh>
                 </geometry>
                 <cast_shadows>false</cast_shadows>

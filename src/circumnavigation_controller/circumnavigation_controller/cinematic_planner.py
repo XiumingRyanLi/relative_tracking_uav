@@ -3,6 +3,10 @@ import math
 from dataclasses import dataclass
 from collections import deque
 
+# Camera-to-car distance DOPE needs to see the whole car in the 46 x 26 deg
+# sim camera (straight down, the 4.4 m car spans the 26 deg direction: >= 9.4 m).
+MIN_TARGET_RANGE = 10.0
+CAR_CENTRE_Z = 0.6          # DOPE box centre above the ground (m)
 
 @dataclass
 class CinematicOffset:
@@ -141,6 +145,9 @@ class CinematicPlanner:
         else:
             offset = self._hold_location(action)
 
+        # --------------------------- change offset depending on the camera model view
+        offset = self._enforce_min_range(offset, overhead_ok=(action_type == "overpass"))
+
         # If the current action has finished, mark this offset finished
         # and start the next action next cycle.
         if u >= 1.0:
@@ -273,3 +280,20 @@ class CinematicPlanner:
 
         x, y, z = self._location_to_offset(location, radius, height)
         return CinematicOffset(x, y, z)
+
+    
+
+    def _enforce_min_range(self, offset: CinematicOffset, overhead_ok: bool) -> CinematicOffset:
+        dz = offset.z - CAR_CENTRE_Z
+        horiz = math.hypot(offset.x, offset.y)
+        if math.hypot(horiz, dz) >= MIN_TARGET_RANGE:
+            return offset
+        if overhead_ok or horiz < 0.5:
+            # Overpass (or directly above): only climbing keeps the path continuous.
+            offset.z = CAR_CENTRE_Z + math.sqrt(MIN_TARGET_RANGE ** 2 - horiz ** 2)
+        else:
+            # Everything else: move straight out along the same bearing, keep the height.
+            need = math.sqrt(max(MIN_TARGET_RANGE ** 2 - dz ** 2, 0.0))
+            offset.x *= need / horiz
+            offset.y *= need / horiz
+        return offset
