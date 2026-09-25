@@ -78,8 +78,9 @@ PARAMETERS = [
     ("enable_visual_heading_filter", True, "Jump-gate and smooth the detector heading."),
     ("visual_heading_alpha", 0.25, "Heading EMA factor per detection."),
     ("yaw_rate_tau_sec", 1.0, "Low-pass time constant of the yaw rate taken from the filtered heading (s)."),
-    ("yaw_rate_min_speed", 0.5,
-     "Below this target speed (m/s) the yaw rate fades to 0 (0 when stopped): a car can't turn in place."),
+    ("yaw_rate_min_speed", 1.0,
+     "Yaw rate is 0 below this target speed (m/s) and fades in up to twice it: a car can't turn "
+     "in place, and at 0.5 position noise on a parked car was enough to pass a fake yaw rate."),
     ("max_yaw_rate_deg", 30.0, "Clamp on the estimated target yaw rate (deg/s)."),
     ("heading_prediction_sec", 0.35,
      "Aim the shot with the heading predicted this far ahead (heading filter lag + detection "
@@ -87,6 +88,12 @@ PARAMETERS = [
     ("enable_shot_rotation_feedforward", True,
      "Add yaw rate x shot offset to the velocity feedforward: in a turn the shot point swings "
      "around the car, which the car velocity alone doesn't include (the steady offset in turns)."),
+    ("max_rotation_feedforward", 5.0,
+     "Cap on the yaw rate x shot offset feedforward (m/s). A sharp turn with a 20 m shot needs "
+     "~5 m/s; 3 cost 3 m of tracking there. Noise had pushed 5+ m/s on a parked car."),
+    ("feedforward_timeout_sec", 0.5,
+     "No velocity / yaw-rate feedforward (and no heading prediction) once the last detection is "
+     "older than this: the estimate's motion is frozen at its last value during a loss."),
     ("max_visual_heading_jump_deg", 60.0, "Heading jumps larger than this are gated (deg)."),
     ("max_visual_heading_distance", 60.0, "UKF only: ignore headings beyond this range (m)."),
     ("enable_heading_ukf", False,
@@ -109,6 +116,17 @@ PARAMETERS = [
     ("gimbal_yaw_deadband_deg", 0.5, "Leave the gimbal yaw alone while the target is within this of centre (deg)."),
     ("gimbal_max_yaw_step_deg", 8.0,
      "Max gimbal yaw change per command (deg); 3 made it unwind too slowly after fast body turns."),
+    ("gimbal_max_pitch_down_deg", -135.0,
+     "Lowest gimbal pitch command (deg); -90 is straight down, below that looks backwards. "
+     "Mount limit MNT1_PITCH_MIN is -135 (was -80 in code, so it could never look straight down)."),
+    ("gimbal_max_pitch_up_deg", 30.0, "Highest gimbal pitch command (deg); mount allows 45."),
+    ("gimbal_max_yaw_deg", 160.0, "Gimbal yaw command limit (deg, +- about the nose); mount limit 160 (was 90)."),
+    ("yaw_hold_radius", 5.0,
+     "Hold the drone's body yaw while it is within this horizontal distance (m) of the target: "
+     "overhead the bearing to the car flips 180 deg, which spun the drone (and the camera with it)."),
+    ("gimbal_detection_timeout_sec", 0.5,
+     "A detection older than this no longer steers the gimbal; it then points at the target "
+     "estimate instead of re-applying the old image error (which made it drift to its limit)."),
     ("gimbal_initial_pitch_deg", -5.0,
      "Gimbal pitch at boot; keep equal to MNT1_NEUTRAL_Y in config/gimbal_startup.parm (deg)."),
 

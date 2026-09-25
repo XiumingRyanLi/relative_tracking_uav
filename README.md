@@ -180,11 +180,21 @@ camera image -> detector -> car pose in the camera frame
   -> camera -> gimbal -> drone -> world transform
   -> target estimator: gating, constant-velocity KF (position, velocity),
      heading EMA + yaw rate
-  -> shot point = car position + shot offset rotated by the (predicted) car heading
-  -> PID with feedforward = car velocity + yaw rate x shot offset
-  -> /mavros/setpoint_velocity/cmd_vel
-gimbal: image-space controller keeps the car centred (5 Hz pitch/yaw commands)
+  -> shot point = car position + shot offset rotated by the (predicted) car heading,
+     kept >= 10 m from the car by the cinematic planner
+  -> PID with feedforward = car velocity + yaw rate x shot offset (only while detections are fresh)
+  -> /mavros/setpoint_velocity/cmd_vel  (body yaw faces the car, held when within 5 m of it)
+gimbal: image-space controller keeps the car centred (5 Hz pitch/yaw commands, one correction per
+        detection); after 0.5 s without a detection it points at the car's estimated position
 ```
+
+### Cinematic shots
+
+`cinematic_planner.py` turns the GUI's shot sequence (`/cinematic_command`) into an offset from the car
+(x forward, y left, z up). Every offset is kept at least `MIN_TARGET_RANGE` = 10 m from the car's box
+centre (`_enforce_min_range`): closer than that the 4.4 m car no longer fits in the 46 x 26 deg camera
+view and DOPE loses it. Holds/moves are pushed outwards along the same bearing at the same height;
+an overpass climbs instead, so its path stays continuous and it can fly straight over the car.
 
 ### Code layout (`src/circumnavigation_controller/circumnavigation_controller/`)
 
@@ -196,7 +206,7 @@ gimbal: image-space controller keeps the car centred (5 Hz pitch/yaw commands)
 | `camera_frames.py` | control | camera -> gimbal -> drone -> world transforms, pose history |
 | `pid_controller.py` | control | velocity PID (filtered D, speed and acceleration limits) |
 | `gimbal_controller.py` | control | gimbal image-space controller |
-| `cinematic_planner.py` | control | shot offset sequence (hold, move, orbit, overpass, push/pull) |
+| `cinematic_planner.py` | control | shot offset sequence (hold, move, orbit, overpass, push/pull), 10 m minimum distance to the car |
 | `flight_sequencer.py` | logistics | GUIDED -> arm -> takeoff -> hover -> tracking, safety RTL |
 | `gimbal_interface.py` | logistics | MAVROS gimbal manager commands and attitude feedback |
 | `run_logger.py` | logging | CSV log, ground-truth evaluation columns, `[chain]` transform debug line |
@@ -214,19 +224,34 @@ gimbal: image-space controller keeps the car centred (5 Hz pitch/yaw commands)
 | `pid_max_accel_xy` | 5 m/s² | matches `WP_ACC` |
 | `heading_prediction_sec` | 0.35 s | aim with the heading predicted over filter lag + detection latency |
 | `enable_shot_rotation_feedforward` | true | adds yaw rate x shot offset; removed most of the sideways lag in turns (4 m -> 1.2 m at 4 deg/s) |
-| `yaw_rate_tau_sec` / `yaw_rate_min_speed` | 1.0 s / 0.5 m/s | yaw rate = smoothed heading derivative, 0 when the car is stopped |
+| `yaw_rate_tau_sec` / `yaw_rate_min_speed` | 1.0 s / 1.0 m/s | yaw rate = smoothed heading derivative, 0 below 1 m/s, full from 2 m/s (0.5 let heading noise on a parked car through) |
+| `max_rotation_feedforward` | 5 m/s | cap on yaw rate x shot offset; noise had pushed the drone sideways at 5+ m/s |
+| `feedforward_timeout_sec` | 0.5 s | no feedforward or heading prediction once the last detection is older than this (the estimate's motion is frozen during a loss) |
 | `gimbal_kp_yaw`, `gimbal_kd_yaw`, `gimbal_yaw_deadband_deg`, `gimbal_max_yaw_step_deg` | 0.4, 0, 0.5, 8 | less yaw jitter without big overshoot when the body turns fast |
+| `gimbal_max_pitch_down_deg` / `gimbal_max_yaw_deg` | -135 / ±160 deg | the mount's real range (was -80 / ±90 in code, so the camera could never look straight down); below -90 it looks backwards, so an overhead pass needs no 180 deg yaw flip |
+| `yaw_hold_radius` | 5 m | the drone holds its body yaw when nearly above the car, where the bearing flips 180 deg |
+| `gimbal_detection_timeout_sec` | 0.5 s | each detection steers the gimbal once; after 0.5 s without one the gimbal points at the car's estimated position instead (re-applying the old error drove it to its pitch limit, e.g. into the sky) |
 | `enable_heading_ukf` | false | the CTRV UKF flips its heading by 180 deg in turns with DOPE-level noise (crash bug fixed, filter still not usable) |
 
 Things that were tried and made it worse: `PSC_NE_JERK 20` (removed damping; the drone oscillated
 ±6 m around a parked car) and a speed-scaled heading filter (barely helped).
 
+Current behaviour (car parked, run `20260925_173510`): holds 0.4 m from the shot point, flies an
+overpass straight over the car (88 deg look-down) while losing the detection only 4.5 % of the time,
+1.1 % over the whole run.
+
 Known limitations:
-- Shots closer than ~10 m to the car (or nearly overhead) lose the detection: the 4.4 m car no
-  longer fits in the 46 x 26 deg camera view. Keep shot radius/height so the distance is >= 10 m.
+- Directly overhead the gimbal is near gimbal lock: its yaw corrections barely move the car in the
+  image and swing through large angles (seen -92 -> +157 deg). Harmless while the pitch keeps the
+  car in view, but a pass slightly beside the car is more robust (DOPE is also weakest straight down).
+- After leaving the 5 m yaw-hold zone the body turns ~180 deg to face the car again (up to ~47 deg/s)
+  and the car sits 12-20 deg off-centre for ~5 s while the gimbal unwinds.
 - Sudden car speed changes give a 10-25 m transient (drone acceleration and command delay).
-- While a shot transitions (e.g. back -> front) the shot point's own motion is not fed forward yet.
+- While a shot transitions (e.g. back -> front) the shot point's own motion is not fed forward yet
+  (5-8 m lag during the move).
 - On a parked car the shot point can wander ~±2 m from DOPE's viewing-angle-dependent heading bias.
+- The planner's default shot (`default_radius` / `default_height` 3 m) is inside the 10 m limit; it is
+  pushed out automatically, but setting defaults that already satisfy it avoids the correction.
 
 ## Logging and evaluation
 
@@ -248,9 +273,10 @@ Useful extra sources:
 
 ## DOPE model and training data
 
-- Weights used by the sim: `DOPE_WEIGHTS` in `sim_launch.py`
-  (`~/Desktop/ryan/Deep_Object_Pose/train/output/weights_droneview_v2/net_epoch_0725.pth`).
-  A copy of this baseline is kept in `weights/dope/` (not committed, see `weights/dope/README.md`).
+- Weights used by the sim: `DOPE_WEIGHTS` in `sim_launch.py`, now
+  `weights/dope/audi_droneview_v3_epoch0850.pth` (the previous
+  `audi_droneview_v2_epoch0725.pth` is kept next to it). The `.pth` files are local only
+  (not committed); see `weights/dope/README.md` for provenance and test results.
 - Training data (BlenderProc, `Deep_Object_Pose/data_generation/blenderproc_data_gen`, locally
   patched with `--near/--far` true-distance sampling and `--elev_min/--elev_max` drone viewpoints).
   Each dataset folder has a `GENERATION_COMMAND.txt`.
@@ -261,9 +287,35 @@ Useful extra sources:
 | `~/data/AudiDroneView_v2` | 3000 | 3-75 deg, 7-45 m, whole car in frame | v2 model (with v1) |
 | `~/data/AudiDroneView_v3_overhead` | 1200 | 55-89 deg, 6-20 m, mild truncation | failure case: nearly overhead |
 | `~/data/AudiDroneView_v3_close` | 1200 | 20-89 deg, 4-10 m, car partly out of frame | failure case: close range |
+| `~/data/AudiDroneView_test_v3` | 3 x 150 | overhead / close / standard | held-out test set (not trained on) |
 
 The v3 sets target the detection losses in runs `20260925_131648` / `_131943`: every lost frame had
-the car partly outside the image, at 4-9 m range or 59-89 deg look-down. To retrain, fine-tune from
-the v2 weights on all four sets (same form as the v2 run in `weights/dope/audi_droneview_v2_header.txt`;
-training resumes the epoch count from the weights file name), and compare against the baseline on a
-held-out set of failure-case frames before switching `DOPE_WEIGHTS`.
+the car partly outside the image, at 4-9 m range or 59-89 deg look-down. The v3 model was fine-tuned
+from v2 epoch 750 to 850 on all four sets (`~/data/AudiDroneView_all_v3`, 5700 frames, ~60 s/epoch):
+
+```bash
+cd ~/Desktop/ryan/Deep_Object_Pose/train
+~/miniconda3/envs/ryan_6dof/bin/torchrun --nproc_per_node=1 train.py --data ~/data/AudiDroneView_all_v3 \
+  --object Audi --net_path output/weights_droneview_v2/final_net_epoch_0750.pth --epochs 850 \
+  --outf output/weights_droneview_v3 --batchsize 32 --imagesize 448 --lr 0.0001 --workers 16 --save_every 25
+```
+
+Held-out test set `~/data/AudiDroneView_test_v3` (150 frames each, never trained on):
+
+| Test set | v2 epoch 725 | v3 epoch 850 |
+|---|---|---|
+| overhead (55-89 deg, 6-20 m) | 93% detected | 98% |
+| close (20-89 deg, 4-10 m) | 56% | 65% |
+| standard (3-75 deg, 7-45 m) | 99% | 99% |
+
+Remaining close-range misses have at most 3 of the 8 car corners in the image (a limit of the
+cuboid-keypoint method), so keep shots >= 10 m from the car. Compare models with:
+
+```bash
+source /opt/ros/lyrical/setup.bash
+python3 scripts/eval_dope_weights.py --weights weights/dope/*.pth \
+  --data ~/data/AudiDroneView_test_v3/{overhead,close,standard}
+```
+
+Don't render or train while flying the sim: it saturates the GPU/CPU, DOPE stops detecting and the
+tracking falls apart.

@@ -30,11 +30,17 @@ class GimbalController:
         kd_yaw: float = 0.0,
         yaw_deadband_deg: float = 0.5,
         max_yaw_step_deg: float = 8.0,
+        max_pitch_up_deg: float = 30.0,
+        max_pitch_down_deg: float = -135.0,
+        max_yaw_deg: float = 160.0,
     ):
-        # Gimbal command limits, radians.
-        self.max_pitch_up = math.radians(30.0)
-        self.max_pitch_down = math.radians(-80.0)
-        self.max_yaw = math.radians(90.0)
+        # Gimbal command limits, radians. Match the mount (MNT1_PITCH_MIN/MAX,
+        # MNT1_YAW_MIN/MAX in gazebo-iris-gimbal.parm): pitch below -90 deg
+        # looks backwards under the drone, so the camera can follow the car
+        # straight through an overhead pass without a 180 deg yaw flip.
+        self.max_pitch_up = math.radians(max_pitch_up_deg)
+        self.max_pitch_down = math.radians(max_pitch_down_deg)
+        self.max_yaw = math.radians(max_yaw_deg)
 
         # Image-space PD gains. Yaw is softer than pitch: the drone body also
         # turns to face the target, so both loops correct the same bearing
@@ -143,15 +149,19 @@ class GimbalController:
         dy = target_y - drone_y
         dz = target_z - drone_z
 
+        # Gimbal yaw is relative to the nose and positive to the RIGHT (FRD),
+        # world yaw is ENU (positive counter-clockwise): camera heading =
+        # drone_yaw - gimbal_yaw.
         desired_world_yaw = math.atan2(dy, dx)
-        gimbal_yaw = self.wrap_to_pi(desired_world_yaw - drone_yaw)
+        gimbal_yaw = self.wrap_to_pi(drone_yaw - desired_world_yaw)
         gimbal_yaw = self.clamp(gimbal_yaw, -self.max_yaw, self.max_yaw)
 
         horizontal_dist = math.sqrt(dx * dx + dy * dy)
         horizontal_dist = max(horizontal_dist, 1e-6)
 
-        # Negative pitch points downward in your Gazebo/MAVROS setup.
-        gimbal_pitch = -math.atan2(dz, horizontal_dist)
+        # Pitch is relative to the horizon, negative = down. dz < 0 when the
+        # target is below the drone, so pitch = atan2(dz, horizontal) < 0.
+        gimbal_pitch = math.atan2(dz, horizontal_dist)
         gimbal_pitch = self.clamp(
             gimbal_pitch,
             self.max_pitch_down,

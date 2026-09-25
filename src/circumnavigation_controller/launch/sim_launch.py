@@ -74,12 +74,15 @@ WORKSPACE_ROOT = os.path.join(HOME, 'Desktop', 'ryan', 'relative_tracking_uav')
 REPO_MODELS_DIR = os.path.join(WORKSPACE_ROOT, 'models')
 LOG_DIR = os.path.join(WORKSPACE_ROOT, 'logs')
 
-# DOPE checkpoint used by `detector:=dope`. Kept outside the repo (201 MB);
-# a plain PyTorch state_dict trained with DDP ("module." prefix stripped on
-# load). Object + cuboid dimensions below must match what it was trained on.
-DOPE_WEIGHTS = os.path.join(
-    HOME, 'Desktop', 'ryan', 'Deep_Object_Pose', 'train', 'output', 'weights_droneview_v2', 'net_epoch_0725.pth'
-)
+# DOPE checkpoint used by `detector:=dope`: a plain PyTorch state_dict trained
+# with DDP ("module." prefix stripped on load). Object + cuboid dimensions below
+# must match what it was trained on. Local copies live in weights/dope/ (201 MB
+# each, not committed; see weights/dope/README.md).
+#   v3 epoch 850 (2026-09-25): + overhead / close-range training views; on the
+#       held-out test set 98% overhead / 65% close / 99% standard detection.
+#   v2 epoch 725: previous model (93% / 56% / 99%); to go back, use
+#       'audi_droneview_v2_epoch0725.pth'.
+DOPE_WEIGHTS = os.path.join(WORKSPACE_ROOT, 'weights', 'dope', 'audi_droneview_v3_epoch0850.pth')
 DOPE_OBJECT = 'Audi'
 DOPE_CUBOID_DIMENSIONS_CM = [203.82, 123.95, 441.46]  # from DOPE config_pose.yaml
 

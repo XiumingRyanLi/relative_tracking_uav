@@ -53,20 +53,21 @@ class GimbalInterface:
         self.history = TimedHistory(history_sec)
 
     # ---- commands ----
-    def send(self, pitch_rad: float, yaw_rad: float, now: float):
+    def send(self, pitch_rad: float, yaw_rad: float, now: float) -> bool:
         """Send a pitch/yaw command, at most once per command_period_sec.
-        The first calls claim the gimbal manager instead."""
+        The first calls claim the gimbal manager instead. Returns True if a
+        command was actually sent."""
         if not self._configured:
             self._configure()
-            return
+            return False
 
         # Limit service calls to avoid spamming COMMAND_LONG.
         if now - self._last_cmd_time < self.command_period_sec:
-            return
+            return False
 
         if not self.pitchyaw_client.wait_for_service(timeout_sec=0.1):
             self._log.warning("Gimbal pitchyaw service not ready.", throttle_duration_sec=2.0)
-            return
+            return False
 
         req = GimbalManagerPitchyaw.Request()
         req.pitch = float(math.degrees(pitch_rad))
@@ -80,6 +81,7 @@ class GimbalInterface:
         self.current_yaw = yaw_rad
         self._last_cmd_time = now
         self.pitchyaw_client.call_async(req)
+        return True
 
     def _configure(self):
         if self._configured or self._config_in_progress:

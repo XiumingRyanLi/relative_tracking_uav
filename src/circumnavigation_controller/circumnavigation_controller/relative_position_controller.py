@@ -83,8 +83,8 @@ DEFAULT_SHOT_SEQUENCE = [
     # Other action types (see cinematic_action_schema.py), e.g.:
     {"type": "move_location", "from": "back", "to": "front",
      "radius": 20.0, "height": 4.0, "duration": 20.0},
-    {"type": "overpass", "from": "front", "to": "back", "radius": 3.0,
-     "start_height": 4.0, "peak_height": 10, "end_height": 4.0, "duration": 20.0},
+    {"type": "overpass", "from": "front", "to": "back", "radius": 15.0,
+     "start_height": 4.0, "peak_height": 15, "end_height": 4.0, "duration": 20.0},
     # {"type": "move_location", "from": "right", "to": "left", "via": "front",
     #  "radius": 3.0, "height": 3.0, "duration": 12.0},
 ]
@@ -128,6 +128,9 @@ class RelativePositionController(Node):
             kd_yaw=cfg.gimbal_kd_yaw,
             yaw_deadband_deg=cfg.gimbal_yaw_deadband_deg,
             max_yaw_step_deg=cfg.gimbal_max_yaw_step_deg,
+            max_pitch_up_deg=cfg.gimbal_max_pitch_up_deg,
+            max_pitch_down_deg=cfg.gimbal_max_pitch_down_deg,
+            max_yaw_deg=cfg.gimbal_max_yaw_deg,
         )
         self.cinematic_planner = CinematicPlanner()
         self.cinematic_planner.set_sequence(DEFAULT_SHOT_SEQUENCE)
@@ -192,6 +195,7 @@ class RelativePositionController(Node):
         self.target_received = False
         self.last_target_time = None
         self.detection = None           # last accepted Detection
+        self._gimbal_used_detection = None   # received_time of the detection the gimbal last acted on
         self._search_start_time = None
 
         # ---------------- Subscriptions ----------------
@@ -258,9 +262,6 @@ class RelativePositionController(Node):
 
     def _target_available(self, now: float) -> bool:
         return self.target_received and self._target_is_fresh(now)
-
-    def _detection_fresh(self, now: float) -> bool:
-        return self.detection is not None and (now - self.detection.received_time) <= self.cfg.target_timeout_sec
 
     def _drone_xyz(self):
         p = self.drone_pose.pose.position
@@ -343,7 +344,7 @@ class RelativePositionController(Node):
             "radius": planner.default_radius,
             "height": planner.default_height,
             "start_height": planner.default_height,
-            "peak_height": planner.default_height + 3.0,
+            "peak_height": planner.default_height + 5.0,
             "end_height": planner.default_height,
         }
         validated = []
@@ -501,7 +502,16 @@ class RelativePositionController(Node):
         # target.z: the car is on the ground, and target.z is a noisy estimate
         # of its box centre (~0.6 m up) that the altitude would otherwise chase.
         shot_offset = self.cinematic_planner.update(now)
-        shot_heading = target.heading + target.yaw_rate * self.cfg.heading_prediction_sec
+        # The estimator only updates on detections: once the last one is
+        # older than feedforward_timeout_sec its velocity and yaw rate are
+        # frozen, possibly noisy values, so stop feeding them forward (and
+        # stop predicting the heading with them).
+        motion_fresh = (
+            self.detection is not None
+            and now - self.detection.received_time <= self.cfg.feedforward_timeout_sec
+        )
+        yaw_rate = target.yaw_rate if motion_fresh else 0.0
+        shot_heading = target.heading + yaw_rate * self.cfg.heading_prediction_sec
         rel_x_world, rel_y_world = body_to_world(shot_offset.x, shot_offset.y, shot_heading)
         desired_x = target.x + rel_x_world
         desired_y = target.y + rel_y_world
@@ -513,6 +523,11 @@ class RelativePositionController(Node):
         # Face the target.
         desired_yaw = math.atan2(target.y - drone_y, target.x - drone_x)
         eyaw = wrap_to_pi(desired_yaw - self._drone_yaw())
+        # Nearly overhead the bearing is ill-defined and flips 180 deg as the
+        # drone passes the car: hold the body and let the gimbal pitch (which
+        # can go past straight down) keep the car in view.
+        if math.hypot(target.x - drone_x, target.y - drone_y) < self.cfg.yaw_hold_radius:
+            eyaw = 0.0
 
         self.get_logger().info(
             f"SHOT offset=({shot_offset.x:.2f}, {shot_offset.y:.2f}, {shot_offset.z:.2f}), "
@@ -527,11 +542,19 @@ class RelativePositionController(Node):
         # altitude): the car's velocity plus, in a turn, yaw rate x offset --
         # the shot point swings around the car.
         ff_vx, ff_vy = 0.0, 0.0
-        if self.cfg.enable_velocity_feedforward:
+        if self.cfg.enable_velocity_feedforward and motion_fresh:
             ff_vx, ff_vy = target.vx, target.vy
-        if self.cfg.enable_shot_rotation_feedforward:
-            ff_vx -= target.yaw_rate * rel_y_world
-            ff_vy += target.yaw_rate * rel_x_world
+        if self.cfg.enable_shot_rotation_feedforward and motion_fresh:
+            rot_x, rot_y = -yaw_rate * rel_y_world, yaw_rate * rel_x_world
+            # Cap it: heading noise (e.g. looking steeply down on a parked
+            # car) can fake a yaw rate, and x a 15-20 m offset that became a
+            # 5 m/s sideways push (run 20260925_165217).
+            rot = math.hypot(rot_x, rot_y)
+            cap = self.cfg.max_rotation_feedforward
+            if rot > cap:
+                rot_x, rot_y = rot_x * cap / rot, rot_y * cap / rot
+            ff_vx += rot_x
+            ff_vy += rot_y
         cmd = self.pid.update(ex, ey, ez, eyaw, now, ff_vx=ff_vx, ff_vy=ff_vy)
 
         msg.twist.linear.x = cmd.vx
@@ -555,15 +578,21 @@ class RelativePositionController(Node):
             return
 
         # 1. Target visible: image-space PD on the camera-frame detection.
-        if self._detection_fresh(now):
-            d = self.detection
-            cmd = self.gimbal_ctrl.update_image_pd(
-                cam_x=d.cam_x, cam_y=d.cam_y, cam_z=d.cam_z,
-                current_pitch=self.gimbal.current_pitch,
-                current_yaw=self.gimbal.current_yaw,
-                now=now,
-            )
-            self.gimbal.send(cmd.pitch, cmd.yaw, now)
+        # Each detection is used for one correction only (the PD adds to the
+        # last command, so re-applying an old image error made the gimbal
+        # drift to its limit when detections stopped); until the next
+        # detection arrives the gimbal holds.
+        d = self.detection
+        if d is not None and now - d.received_time <= self.cfg.gimbal_detection_timeout_sec:
+            if d.received_time != self._gimbal_used_detection:
+                cmd = self.gimbal_ctrl.update_image_pd(
+                    cam_x=d.cam_x, cam_y=d.cam_y, cam_z=d.cam_z,
+                    current_pitch=self.gimbal.current_pitch,
+                    current_yaw=self.gimbal.current_yaw,
+                    now=now,
+                )
+                if self.gimbal.send(cmd.pitch, cmd.yaw, now):
+                    self._gimbal_used_detection = d.received_time
             return
 
         # 2. No target: search sweep.
@@ -572,7 +601,8 @@ class RelativePositionController(Node):
                 self._search_sweep(now)
             return
 
-        # 3. Fallback: point at the target estimate.
+        # 3. Detection stale but the target estimate is still fresh: point at
+        # the estimate (absolute, so it can't drift) to re-acquire the car.
         drone_x, drone_y, drone_z = self._drone_xyz()
         cmd = self.gimbal_ctrl.update(
             drone_x=drone_x, drone_y=drone_y, drone_z=drone_z, drone_yaw=self._drone_yaw(),
