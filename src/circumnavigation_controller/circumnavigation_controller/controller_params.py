@@ -56,8 +56,9 @@ PARAMETERS = [
     ("min_visual_target_distance", 0.20, "Reject detections closer than this (m)."),
     ("max_visual_target_distance", 80.0, "Reject detections further than this (m)."),
     ("max_visual_position_jump", 3.0,
-     "Reject a detection further than this + visual_jump_per_m * range from the KF prediction (m)."),
-    ("visual_jump_per_m", 0.10, "Range-proportional part of the jump gate (m per m)."),
+     "target_filter=cv only: reject a detection further than this + visual_jump_per_m * range "
+     "from the KF prediction (m). ctra gates with ctra_gate_nis instead."),
+    ("visual_jump_per_m", 0.10, "target_filter=cv only: range-proportional part of the jump gate (m per m)."),
     ("visual_max_consecutive_rejects", 5,
      "After this many rejects in a row, accept the next detection and re-seed the filters."),
     ("visual_noise_per_m", 0.02, "KF measurement std grows by this per metre of range."),
@@ -94,8 +95,42 @@ PARAMETERS = [
     ("feedforward_timeout_sec", 0.5,
      "No velocity / yaw-rate feedforward (and no heading prediction) once the last detection is "
      "older than this: the estimate's motion is frozen at its last value during a loss."),
+
+    # ---- Target loss: coast on the last estimate ----
+    # Past feedforward_timeout_sec without a detection the drone is COASTING:
+    # the target is predicted on from its last position at its last velocity,
+    # the shot heading is frozen, the height held and the shot sequence paused.
+    # After target_timeout_sec it hovers.
+    ("coast_full_speed_sec", 2.0,
+     "Predict the lost target on at its last velocity for this long after the last detection (s). "
+     "Longer helps on straights, but a constant-velocity guess runs off the track in corners."),
+    ("coast_taper_sec", 1.0,
+     "Then slow the prediction to a stop over this long (s); it stays there until target_timeout_sec."),
+    ("coast_max_distance", 20.0,
+     "Cap on how far the prediction moves the target from its last estimate (m)."),
     ("max_visual_heading_jump_deg", 60.0, "Heading jumps larger than this are gated (deg)."),
+    ("heading_course_min_speed", 3.0,
+     "Above this target speed (m/s) the detector heading is checked against the direction of travel."),
+    ("heading_flip_threshold_deg", 110.0,
+     "A detector heading further than this from the direction of travel is a nose-to-tail flip "
+     "and is turned round 180 deg (flips measured >= 127 deg off, correct readings <= 86 deg)."),
+    ("heading_course_memory_sec", 3.0,
+     "After a KF re-seed (velocity zeroed) the previous velocity is used for that check if it is "
+     "at most this old (s)."),
     ("max_visual_heading_distance", 60.0, "UKF only: ignore headings beyond this range (m)."),
+    ("target_filter", "ctra",
+     "ctra: heading-aided CTRA EKF for position, velocity, acceleration, heading and yaw rate "
+     "(the KF still gates and gives z). cv: the constant-velocity KF + heading EMA as before. "
+     "Offline (scripts/benchmark_target_filter.py, held-out tracks) ctra was 13 % better now, "
+     "29-31 % at 1-2 s ahead, 40 % on velocity and 31 % on heading."),
+    ("ctra_turn_rate_noise", 0.2, "CTRA: white-noise turn-rate derivative std (rad/s^2)."),
+    ("ctra_jerk_noise", 0.5, "CTRA: white-noise jerk std (m/s^3)."),
+    ("ctra_heading_std_deg", 4.0, "CTRA: detector heading measurement std (deg); DOPE measured ~3.6."),
+    ("ctra_gate_nis", 25.0,
+     "CTRA: reject a detection whose position NIS against the EKF prediction exceeds this "
+     "(chi-square, 2 DOF). Above the textbook 13.8 because DOPE's drifting bias makes the EKF "
+     "overconfident: 13.8 rejected 10 % of good frames, 25 about 1 % while letting 1-2 % of "
+     "5-15 m outliers through (the cv jump gate: 5-7 %)."),
     ("enable_heading_ukf", False,
      "Estimate heading + yaw rate with the CTRV UKF instead of the EMA. Not recommended: with "
      "DOPE-level noise it flipped to the opposite heading in turns (offline test 2026-09-25)."),
@@ -131,14 +166,25 @@ PARAMETERS = [
      "Gimbal pitch at boot; keep equal to MNT1_NEUTRAL_Y in config/gimbal_startup.parm (deg)."),
 
     # ---- Search (gimbal sweep while no target) ----
-    ("enable_search_mode", False, "Sweep the gimbal while tracking has no target."),
-    ("search_gimbal_pitch_center_deg", -35.0, "Search sweep pitch centre (deg)."),
+    ("enable_search_mode", True,
+     "Once the target is lost for target_timeout_sec: climb to search_altitude where the drone "
+     "is and sweep the gimbal around the last estimate. False: hover in place."),
+    ("search_altitude", 20.0,
+     "Search height above shot_ground_z (m): a wider view of the ground, and DOPE still "
+     "detects the car out to ~45 m."),
+    ("search_gimbal_pitch_center_deg", -35.0,
+     "Search sweep pitch centre (deg) when there has been no target yet; afterwards the sweep "
+     "is centred on the last target estimate."),
     ("search_gimbal_pitch_amp_deg", 15.0, "Search sweep pitch amplitude (deg)."),
     ("search_gimbal_yaw_amp_deg", 75.0, "Search sweep yaw amplitude (deg)."),
     ("search_gimbal_period_sec", 8.0, "Search sweep period (s)."),
 
     # ---- Cinematic commands ----
     ("cinematic_command_topic", "/cinematic_command", "JSON shot sequences from the GUI."),
+    ("shot_transition_speed", 5.0,
+     "A new sequence first flies around the car from the current shot point to its start "
+     "point at this speed relative to the car (m/s); jumping there cut past the car."),
+    ("shot_transition_min_sec", 2.0, "Shortest such transition (s)."),
 
     # ---- Evaluation inputs (logged only) ----
     ("truth_target_odom_topic", "/landing_vehicle/odometry",

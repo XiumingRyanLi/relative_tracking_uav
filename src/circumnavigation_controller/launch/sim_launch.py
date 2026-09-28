@@ -4,11 +4,24 @@ Sim launch: Gazebo + ros_gz_bridge + ArduPilot SITL + MAVROS + perception/contro
 Assumes you've already got:
   - ardupilot_gazebo built at $HOME/ardupilot_gazebo
   - ardupilot checked out at $HOME/ardupilot
-  - the world file at <this_pkg>/worlds/iris_runway_new.sdf (adjust path below)
+  - the world file at ~/ardupilot_gazebo/worlds/<world>.sdf (copies in <repo>/worlds)
 
 Usage:
     ros2 launch circumnavigation_controller sim_launch.py
     ros2 launch circumnavigation_controller sim_launch.py detector:=dope
+    ros2 launch circumnavigation_controller sim_launch.py world:=iris_monza
+    ros2 launch circumnavigation_controller sim_launch.py world:=iris_silverstone race:=true
+
+`world` is the world file name without .sdf (default iris_runway_new). The
+file's <world name="..."> must equal it, since gz topic names contain it:
+  iris_runway_new    - airfield runway
+  iris_monza         - Monza race track (models/race_track_monza)
+  iris_silverstone   - Silverstone race track (models/race_track_silverstone)
+  iris_oschersleben  - Oschersleben race track (models/race_track_oschersleben)
+
+`race:=true` (track worlds only) starts race_driver, which drives the car
+round the world's racing line (config/race_lines/<world>.csv) once the drone
+has taken off: flat out on straights, braking into corners.
 
 `detector` picks the perception node feeding /aruco_target/visual_odom:
   aruco (default) - AprilTag/ArUco solvePnP detector
@@ -28,6 +41,7 @@ from launch.conditions import IfCondition
 from launch.event_handlers import OnProcessExit, OnShutdown
 from launch.substitutions import EqualsSubstitution, LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 PACKAGE_NAME = 'circumnavigation_controller'
 
@@ -58,9 +72,9 @@ GUIDED_LIMITS_PARM_FILE = os.path.join(
 )
 WORLDS_DIR = os.path.join(HOME, 'ardupilot_gazebo', 'worlds')
 MODELS_DIR = os.path.join(HOME, 'ardupilot_gazebo', 'models')
-WORLD_FILE = 'iris_runway_new.sdf'  # relative - gz must be run from WORLDS_DIR so
-                                    # relative <uri> includes in the sdf resolve
-WORLD_NAME = 'iris_runway_new'  # must match whatever <world name="..."> is in the sdf
+# World files live in WORLDS_DIR as <world>.sdf (see the `world` launch arg);
+# gz must be run from WORLDS_DIR so relative <uri> includes in the sdf resolve.
+DEFAULT_WORLD = 'iris_runway_new'
 
 # relative_position_controller.py writes its relative_pid_<timestamp>.csv
 # log using a bare relative filename - i.e. wherever the node's cwd happens
@@ -175,6 +189,29 @@ def generate_launch_description():
         'detector', default_value='aruco', choices=['aruco', 'dope'],
         description='Perception node publishing /aruco_target/visual_odom: aruco or dope',
     )
+    world_arg = DeclareLaunchArgument(
+        'world', default_value=DEFAULT_WORLD,
+        description='World in ~/ardupilot_gazebo/worlds, without .sdf; its '
+                    '<world name> must match (e.g. iris_runway_new, iris_monza)',
+    )
+    world = LaunchConfiguration('world')
+    race_arg = DeclareLaunchArgument(
+        'race', default_value='false', choices=['true', 'false'],
+        description='Drive the car round the track with race_driver (needs '
+                    'config/race_lines/<world>.csv, i.e. a race-track world)',
+    )
+
+    use_sim_time_arg = DeclareLaunchArgument(
+        'use_sim_time', default_value='true', choices=['true', 'false'],
+        description='Run the ROS nodes on the Gazebo /clock',
+    )
+    # Every ROS node runs on the Gazebo /clock (bridged by gz_bridge). The
+    # camera images carry sim-time stamps; with MAVROS and the controller on
+    # wall time the controller's capture-time pose/gimbal lookup was ~1.8e9 s
+    # off, so it fell back to the live values ("history match ... from
+    # capture time" warnings) and mis-placed detections while the drone
+    # turned or the gimbal moved.
+    SIM_TIME = {'use_sim_time': ParameterValue(LaunchConfiguration('use_sim_time'), value_type=bool)}
 
     # relative_position_controller's cwd (see LOG_DIR above) needs to exist
     # before the node tries to open its CSV log there.
@@ -198,14 +235,14 @@ def generate_launch_description():
     )
 
     gazebo = ExecuteProcess(
-        cmd=['gz', 'sim', WORLD_FILE, '-v', '-r'],
+        cmd=['gz', 'sim', [world, '.sdf'], '-v', '-r'],
         cwd=WORLDS_DIR,
         prefix=['gnome-terminal --title="Gazebo" --'],
         output='screen'
     )
 
     # Camera + clock bridge
-    # NOTE: iris_runway_new.sdf includes model://iris_with_dope_gimbal (this
+    # NOTE: the worlds include model://iris_with_dope_gimbal (this
     # repo's models/) under the name iris_with_gimbal: the Iris with a real
     # 3-axis gimbal that ArduPilot drives on SERVO9/10/11. Its camera is on the
     # gimbal's pitch_link, 1280x720, 0.8 rad HFOV -- matching the detector
@@ -213,15 +250,15 @@ def generate_launch_description():
     # ardupilot_gazebo/worlds/iris_with_gimbal, a fixed body camera on
     # `camera_link`, so gimbal commands moved nothing.) Check with
     # `gz topic -l` if you change the model.
-    CAMERA_TOPIC = (
-        f'/world/{WORLD_NAME}/model/iris_with_gimbal/model/gimbal/'
+    CAMERA_TOPIC = [
+        '/world/', world, '/model/iris_with_gimbal/model/gimbal/'
         'link/pitch_link/sensor/camera/image'
-    )
+    ]
     gz_bridge = Node(
         package='ros_gz_bridge',
         executable='parameter_bridge',
         arguments=[
-            f'{CAMERA_TOPIC}@sensor_msgs/msg/Image[gz.msgs.Image',
+            CAMERA_TOPIC + ['@sensor_msgs/msg/Image[gz.msgs.Image'],
             '/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock',
         ],
         remappings=[
@@ -248,6 +285,18 @@ def generate_launch_description():
             ('/model/LandingVehicle/odometry', '/landing_vehicle/odometry'),
         ],
         output='screen',
+    )
+
+    # Races the car round the track (race:=true). Waits by itself until the
+    # drone has taken off and hovered (wait_for_drone), so it can start with
+    # Gazebo.
+    race_driver = Node(
+        package=PACKAGE_NAME,
+        executable='race_driver',
+        condition=IfCondition(LaunchConfiguration('race')),
+        parameters=[{'world': world}, SIM_TIME],
+        prefix=['gnome-terminal --title="Race Driver" --'],
+        output='screen'
     )
 
     ardupilot_sitl = ExecuteProcess(
@@ -289,7 +338,7 @@ def generate_launch_description():
         # message. This MAVROS build ignores per-plugin YAML config for the
         # mapping (verified: even the stock apm_config.yaml leaves it empty),
         # and nothing here consumes the rangefinder, so the plugin is disabled.
-        parameters=[{'fcu_url': 'udp://:14555@', 'plugin_denylist': ['distance_sensor']}],
+        parameters=[{'fcu_url': 'udp://:14555@', 'plugin_denylist': ['distance_sensor']}, SIM_TIME],
         prefix=['gnome-terminal --title="MAVROS" --'],
         output='screen'
     )
@@ -306,7 +355,7 @@ def generate_launch_description():
             'imgsz_width': 1280,
             'imgsz_height': 720,
             'camera_fov_horizontal': 0.8,
-        }],
+        }, SIM_TIME],
         prefix=['gnome-terminal --title="Aruco Detector" --'],
         output='screen'
     )
@@ -325,7 +374,7 @@ def generate_launch_description():
             'object_name': DOPE_OBJECT,
             'cuboid_dimensions_cm': DOPE_CUBOID_DIMENSIONS_CM,
             'processing_rate': 20.0,
-        }],
+        }, SIM_TIME],
         prefix=['gnome-terminal --title="DOPE Detector" --'],
         output='screen'
     )
@@ -347,7 +396,7 @@ def generate_launch_description():
             # (r=0.94), and 'horizon'/'auto' left a vertical error equal to the
             # drone pitch (slope -0.97, up to 31 deg). So use 'body'.
             'gimbal_attitude_frame': 'body',
-        }],
+        }, SIM_TIME],
         prefix=['gnome-terminal --title="Relative Position Controller" --'],
         output='screen'
     )
@@ -355,6 +404,7 @@ def generate_launch_description():
     cinematic_gui = Node(
         package=PACKAGE_NAME,
         executable='cinematic_gui',
+        parameters=[SIM_TIME],
         prefix=['gnome-terminal --title="Cinematic GUI" --'],
         output='screen'
     )
@@ -403,12 +453,16 @@ def generate_launch_description():
 
     return LaunchDescription([
         detector_arg,
+        world_arg,
+        use_sim_time_arg,
+        race_arg,
         kill_all_on_shutdown,
         set_gz_plugin_path,
         set_gz_resource_path,
         gazebo,
         gz_bridge,
         car_bridge,
+        race_driver,
         delayed_sitl,
         delayed_mavlink_stack,
         plot_on_controller_exit,

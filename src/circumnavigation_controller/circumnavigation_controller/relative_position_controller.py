@@ -72,19 +72,19 @@ except ImportError:
 # (measured: full 8-corner detections from 8 m, nothing below 8 m at any
 # input scale).
 DEFAULT_SHOT_SEQUENCE = [
-    # {
-    #     "type": "hold_location",
-    #     "location": "right",
-    #     "radius": 18.0,
-    #     "height": 4.0,
-    #     "duration": 1000.0,
-    # },
+    {
+        "type": "hold_location",
+        "location": "back",
+        "radius": 18.0,
+        "height": 4.0,
+        "duration": 10.0,
+    },
 
     # Other action types (see cinematic_action_schema.py), e.g.:
-    {"type": "move_location", "from": "back", "to": "front",
-     "radius": 20.0, "height": 4.0, "duration": 20.0},
-    {"type": "overpass", "from": "front", "to": "back", "radius": 15.0,
-     "start_height": 4.0, "peak_height": 15, "end_height": 4.0, "duration": 20.0},
+    # {"type": "move_location", "from": "back", "to": "front",
+    #  "radius": 20.0, "height": 4.0, "duration": 20.0},
+    # {"type": "overpass", "from": "front", "to": "back", "radius": 15.0,
+    #  "start_height": 4.0, "peak_height": 15, "end_height": 4.0, "duration": 20.0},
     # {"type": "move_location", "from": "right", "to": "left", "via": "front",
     #  "radius": 3.0, "height": 3.0, "duration": 12.0},
 ]
@@ -106,6 +106,8 @@ class RelativePositionController(Node):
                 f"gimbal_attitude_frame must be one of {GIMBAL_ATTITUDE_FRAMES}, "
                 f"got '{self.gimbal_attitude_frame}'"
             )
+        if str(cfg.target_filter).lower() not in ("ctra", "cv"):
+            raise ValueError(f"target_filter must be 'ctra' or 'cv', got '{cfg.target_filter}'")
         self.T_gimbal_camera = gimbal_camera_transform(
             cfg.gimbal_camera_roll_deg, cfg.gimbal_camera_pitch_deg, cfg.gimbal_camera_yaw_deg,
         )
@@ -132,7 +134,10 @@ class RelativePositionController(Node):
             max_pitch_down_deg=cfg.gimbal_max_pitch_down_deg,
             max_yaw_deg=cfg.gimbal_max_yaw_deg,
         )
-        self.cinematic_planner = CinematicPlanner()
+        self.cinematic_planner = CinematicPlanner(
+            transition_speed=cfg.shot_transition_speed,
+            transition_min_sec=cfg.shot_transition_min_sec,
+        )
         self.cinematic_planner.set_sequence(DEFAULT_SHOT_SEQUENCE)
         self.estimator = TargetEstimator(
             heading_axis={"x": 0, "y": 1, "z": 2}[str(cfg.target_heading_axis).lower()],
@@ -159,7 +164,15 @@ class RelativePositionController(Node):
             max_heading_jump=math.radians(cfg.max_visual_heading_jump_deg),
             max_heading_distance=cfg.max_visual_heading_distance,
             enable_heading_filter=bool(cfg.enable_visual_heading_filter),
+            heading_course_min_speed=cfg.heading_course_min_speed,
+            heading_flip_threshold=math.radians(cfg.heading_flip_threshold_deg),
+            heading_course_memory_sec=cfg.heading_course_memory_sec,
             enable_heading_ukf=bool(cfg.enable_heading_ukf),
+            use_ctra=str(cfg.target_filter).lower() == "ctra",
+            ctra_s_wdot=cfg.ctra_turn_rate_noise,
+            ctra_s_jerk=cfg.ctra_jerk_noise,
+            ctra_heading_std=math.radians(cfg.ctra_heading_std_deg),
+            ctra_gate_nis=cfg.ctra_gate_nis,
             ukf_coast_timeout_sec=cfg.ukf_coast_timeout_sec,
             ukf_std_a=cfg.ukf_std_a,
             ukf_std_yawdd=cfg.ukf_std_yawdd,
@@ -197,6 +210,10 @@ class RelativePositionController(Node):
         self.detection = None           # last accepted Detection
         self._gimbal_used_detection = None   # received_time of the detection the gimbal last acted on
         self._search_start_time = None
+        self._search_hold_xy = None     # where the drone climbs while searching
+        self._coast_start_time = None   # set while coasting through a target loss
+        self._coast_z = None            # drone height held while coasting
+        self._shot_paused_sec = 0.0     # coasting time kept off the shot clock
 
         # ---------------- Subscriptions ----------------
         reliable_qos = QoSProfile(
@@ -248,7 +265,8 @@ class RelativePositionController(Node):
         self.get_logger().info(
             "RelativePositionController started. Vision target source: /aruco_target/visual_odom, "
             f"gimbal_attitude_frame={self.gimbal_attitude_frame}, "
-            f"search_mode={cfg.enable_search_mode}, CSV: {self.run_log.filename}"
+            f"search_mode={cfg.enable_search_mode}, target_filter={cfg.target_filter}, "
+            f"CSV: {self.run_log.filename}"
         )
 
     # ------------------------------------------------------------------
@@ -284,9 +302,12 @@ class RelativePositionController(Node):
     def _enter_search_mode(self):
         if self._search_start_time is None:
             self._search_start_time = self._now()
+            x, y, _ = self._drone_xyz()
+            self._search_hold_xy = (x, y)
             self.pid.reset()
             self.get_logger().warning(
-                "No visual target available — entering SEARCH mode. Sweeping the gimbal."
+                f"No visual target available — entering SEARCH mode: climbing to "
+                f"{self.cfg.search_altitude:.0f} m at ({x:.1f}, {y:.1f}) and sweeping the gimbal."
             )
 
     def _exit_search_mode(self):
@@ -294,6 +315,68 @@ class RelativePositionController(Node):
             self._search_start_time = None
             self.pid.reset()
             self.get_logger().info("Visual target acquired — switching to TRACK mode.")
+
+    def _update_coast(self, now: float, drone_z: float) -> bool:
+        """Enter/leave COAST (no detection for feedforward_timeout_sec); True while coasting."""
+        lost = self.detection is None or now - self.detection.received_time > self.cfg.feedforward_timeout_sec
+        if lost and self._coast_start_time is None:
+            self._coast_start_time = now
+            self._coast_z = drone_z
+            self.get_logger().warning(
+                f"Target lost — COASTING on its last velocity at z={drone_z:.1f} m, shot sequence paused."
+            )
+        elif not lost and self._coast_start_time is not None:
+            self._shot_paused_sec += now - self._coast_start_time
+            self.get_logger().info(
+                f"Target re-acquired after {now - self._coast_start_time:.1f} s — resuming the shot."
+            )
+            self._coast_start_time = None
+            self._coast_z = None
+        return lost
+
+    def _shot_clock(self, now: float) -> float:
+        """Time for the cinematic planner: stands still while coasting."""
+        paused = self._shot_paused_sec
+        if self._coast_start_time is not None:
+            paused += now - self._coast_start_time
+        return now - paused
+
+    def _predicted_target(self, now: float):
+        """Target (x, y, z) carried on from its last estimate at its last
+        velocity, plus how much of that velocity still applies now (1 -> 0).
+
+        The estimate only moves on detections. The prediction runs at full
+        speed for coast_full_speed_sec, slows to a stop over coast_taper_sec
+        and never moves more than coast_max_distance from the last estimate.
+        Between normal detections it is a small correction.
+        """
+        target = self.estimator
+        if self.detection is None:
+            return target.x, target.y, target.z, 0.0
+        cfg = self.cfg
+        # The estimate is where the car was when the frame was captured; the
+        # car has moved on by the detection latency since (it trailed the car
+        # by 0.7-0.8 m at 11 m/s, runs 20260928_145616/150220). Carry it on
+        # from the capture time -- unless the stamp is in another clock
+        # domain (use_sim_time mismatch), then from when it was received.
+        dt = now - self.detection.stamp_sec
+        if not 0.0 <= dt <= now - self.detection.received_time + 1.0:
+            dt = now - self.detection.received_time
+        dt = max(0.0, dt)
+        t_full, t_taper = cfg.coast_full_speed_sec, max(cfg.coast_taper_sec, 1e-3)
+        if dt <= t_full:
+            travel_sec, rate = dt, 1.0
+        elif dt < t_full + t_taper:
+            e = dt - t_full
+            travel_sec, rate = t_full + e - e * e / (2.0 * t_taper), 1.0 - e / t_taper
+        else:
+            travel_sec, rate = t_full + 0.5 * t_taper, 0.0
+        dx, dy = target.vx * travel_sec, target.vy * travel_sec
+        dist = math.hypot(dx, dy)
+        if dist > cfg.coast_max_distance:
+            dx, dy = dx * cfg.coast_max_distance / dist, dy * cfg.coast_max_distance / dist
+            rate = 0.0
+        return target.x + dx, target.y + dy, target.z, rate
 
     def _log_row(self, now, stage, drone_xyz, desired_xyz, errors, command):
         self.run_log.log(
@@ -349,7 +432,7 @@ class RelativePositionController(Node):
         }
         validated = []
         for i, raw in enumerate(raw_actions):
-            action = validate_action(raw, i, dynamic_defaults, warn=self.get_logger().warn)
+            action = validate_action(raw, i, dynamic_defaults, warn=self.get_logger().warning)
             if action is not None:
                 validated.append(action)
         if not validated:
@@ -421,7 +504,14 @@ class RelativePositionController(Node):
         T_world_target = T_world_camera @ T_camera_target
 
         distance = math.sqrt(p_cam.x ** 2 + p_cam.y ** 2 + p_cam.z ** 2)
+        flips_before = self.estimator.heading_flips
         reject_reason = self.estimator.update(T_world_target, distance, stamp_sec)
+        if self.estimator.heading_flips != flips_before:
+            self.get_logger().warning(
+                f"Detector heading was nose-to-tail at {distance:.0f} m (against the direction "
+                f"of travel); turned round ({self.estimator.heading_flips} so far).",
+                throttle_duration_sec=1.0,
+            )
         if reject_reason is not None:
             self.get_logger().warning(
                 f"Rejected visual target ({reject_reason}), "
@@ -485,54 +575,60 @@ class RelativePositionController(Node):
             return
 
         if not self._target_available(now):
-            if not self.cfg.enable_search_mode:
-                self.get_logger().warning(
-                    "Tracking enabled but no visual target received, holding.",
-                    throttle_duration_sec=5.0,
-                )
-                self.vel_pub.publish(msg)   # zero velocity
+            if self.cfg.enable_search_mode:
+                self._publish_search_setpoint(now, drone_xyz, msg)
+                return
+            self.get_logger().warning(
+                "Tracking enabled but no visual target received, holding.",
+                throttle_duration_sec=5.0,
+            )
+            self.vel_pub.publish(msg)   # zero velocity
+            self._log_row(now, "hold", drone_xyz, drone_xyz, (0.0, 0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0))
             return
 
         self._exit_search_mode()
         target = self.estimator
+
+        # The estimator only updates on detections: once the last one is
+        # older than feedforward_timeout_sec we are COASTING. Its yaw rate is
+        # then a frozen, possibly noisy value, so the shot heading is held
+        # (no rotation feedforward or heading prediction), the target is
+        # carried on at its last velocity (_predicted_target), the drone holds
+        # the height it had when the target was lost and the shot sequence
+        # waits, so it resumes where it left off on re-acquisition.
+        coasting = self._update_coast(now, drone_z)
+        target_x, target_y, _, velocity_scale = self._predicted_target(now)
 
         # Desired position = target position + shot offset rotated by the
         # target heading (predicted ahead by its filter lag + detection
         # latency). The shot height is flown above the ground, not above
         # target.z: the car is on the ground, and target.z is a noisy estimate
         # of its box centre (~0.6 m up) that the altitude would otherwise chase.
-        shot_offset = self.cinematic_planner.update(now)
-        # The estimator only updates on detections: once the last one is
-        # older than feedforward_timeout_sec its velocity and yaw rate are
-        # frozen, possibly noisy values, so stop feeding them forward (and
-        # stop predicting the heading with them).
-        motion_fresh = (
-            self.detection is not None
-            and now - self.detection.received_time <= self.cfg.feedforward_timeout_sec
-        )
-        yaw_rate = target.yaw_rate if motion_fresh else 0.0
+        shot_offset = self.cinematic_planner.update(self._shot_clock(now))
+        yaw_rate = 0.0 if coasting else target.yaw_rate
         shot_heading = target.heading + yaw_rate * self.cfg.heading_prediction_sec
         rel_x_world, rel_y_world = body_to_world(shot_offset.x, shot_offset.y, shot_heading)
-        desired_x = target.x + rel_x_world
-        desired_y = target.y + rel_y_world
-        desired_z = self.cfg.shot_ground_z + shot_offset.z
+        desired_x = target_x + rel_x_world
+        desired_y = target_y + rel_y_world
+        desired_z = self._coast_z if coasting else self.cfg.shot_ground_z + shot_offset.z
 
         ex = desired_x - drone_x
         ey = desired_y - drone_y
         ez = desired_z - drone_z
         # Face the target.
-        desired_yaw = math.atan2(target.y - drone_y, target.x - drone_x)
+        desired_yaw = math.atan2(target_y - drone_y, target_x - drone_x)
         eyaw = wrap_to_pi(desired_yaw - self._drone_yaw())
         # Nearly overhead the bearing is ill-defined and flips 180 deg as the
         # drone passes the car: hold the body and let the gimbal pitch (which
         # can go past straight down) keep the car in view.
-        if math.hypot(target.x - drone_x, target.y - drone_y) < self.cfg.yaw_hold_radius:
+        if math.hypot(target_x - drone_x, target_y - drone_y) < self.cfg.yaw_hold_radius:
             eyaw = 0.0
 
         self.get_logger().info(
-            f"SHOT offset=({shot_offset.x:.2f}, {shot_offset.y:.2f}, {shot_offset.z:.2f}), "
+            f"{'COAST' if coasting else 'SHOT'} "
+            f"offset=({shot_offset.x:.2f}, {shot_offset.y:.2f}, {shot_offset.z:.2f}), "
             f"desired=({desired_x:.2f}, {desired_y:.2f}, {desired_z:.2f}), "
-            f"target=({target.x:.2f}, {target.y:.2f}, {target.z:.2f}), "
+            f"target=({target_x:.2f}, {target_y:.2f}, {target.z:.2f}), "
             f"target_vel=({target.vx:.2f}, {target.vy:.2f}, {target.vz:.2f}), "
             f"heading={math.degrees(target.heading):.1f}",
             throttle_duration_sec=0.5,
@@ -540,11 +636,12 @@ class RelativePositionController(Node):
 
         # Feedforward = velocity of the shot point (no vertical: fixed
         # altitude): the car's velocity plus, in a turn, yaw rate x offset --
-        # the shot point swings around the car.
+        # the shot point swings around the car. While coasting the velocity
+        # follows the prediction as it slows to a stop.
         ff_vx, ff_vy = 0.0, 0.0
-        if self.cfg.enable_velocity_feedforward and motion_fresh:
-            ff_vx, ff_vy = target.vx, target.vy
-        if self.cfg.enable_shot_rotation_feedforward and motion_fresh:
+        if self.cfg.enable_velocity_feedforward:
+            ff_vx, ff_vy = target.vx * velocity_scale, target.vy * velocity_scale
+        if self.cfg.enable_shot_rotation_feedforward and not coasting:
             rot_x, rot_y = -yaw_rate * rel_y_world, yaw_rate * rel_x_world
             # Cap it: heading noise (e.g. looking steeply down on a parked
             # car) can fake a yaw rate, and x a 15-20 m offset that became a
@@ -564,8 +661,35 @@ class RelativePositionController(Node):
         self.vel_pub.publish(msg)
 
         self._log_row(
-            now, "stage2", drone_xyz,
+            now, "coast" if coasting else "stage2", drone_xyz,
             (desired_x, desired_y, desired_z),
+            (ex, ey, ez, math.degrees(eyaw)),
+            (cmd.vx, cmd.vy, cmd.vz, cmd.yaw_rate),
+        )
+
+    def _publish_search_setpoint(self, now: float, drone_xyz, msg: TwistStamped):
+        """SEARCH: climb to search_altitude where the search started, facing
+        the last target estimate (the gimbal sweeps around it)."""
+        self._enter_search_mode()
+        drone_x, drone_y, drone_z = drone_xyz
+        hold_x, hold_y = self._search_hold_xy
+        desired_z = self.cfg.shot_ground_z + self.cfg.search_altitude
+        ex, ey, ez = hold_x - drone_x, hold_y - drone_y, desired_z - drone_z
+        eyaw = 0.0
+        if self.target_received:
+            target_x, target_y, _, _ = self._predicted_target(now)
+            if math.hypot(target_x - drone_x, target_y - drone_y) >= self.cfg.yaw_hold_radius:
+                desired_yaw = math.atan2(target_y - drone_y, target_x - drone_x)
+                eyaw = wrap_to_pi(desired_yaw - self._drone_yaw())
+        cmd = self.pid.update(ex, ey, ez, eyaw, now)
+
+        msg.twist.linear.x = cmd.vx
+        msg.twist.linear.y = cmd.vy
+        msg.twist.linear.z = cmd.vz
+        msg.twist.angular.z = cmd.yaw_rate
+        self.vel_pub.publish(msg)
+        self._log_row(
+            now, "search", drone_xyz, (hold_x, hold_y, desired_z),
             (ex, ey, ez, math.degrees(eyaw)),
             (cmd.vx, cmd.vy, cmd.vz, cmd.yaw_rate),
         )
@@ -602,23 +726,41 @@ class RelativePositionController(Node):
             return
 
         # 3. Detection stale but the target estimate is still fresh: point at
-        # the estimate (absolute, so it can't drift) to re-acquire the car.
+        # where the car is predicted to be now (absolute, so it can't drift)
+        # to re-acquire it.
         drone_x, drone_y, drone_z = self._drone_xyz()
+        target_x, target_y, target_z, _ = self._predicted_target(now)
         cmd = self.gimbal_ctrl.update(
             drone_x=drone_x, drone_y=drone_y, drone_z=drone_z, drone_yaw=self._drone_yaw(),
-            target_x=self.estimator.x, target_y=self.estimator.y, target_z=self.estimator.z,
+            target_x=target_x, target_y=target_y, target_z=target_z,
         )
         self.gimbal.send(cmd.pitch, cmd.yaw, now)
 
     def _search_sweep(self, now: float):
+        """Sweep the gimbal around the last target estimate (or, before any
+        target, around search_gimbal_pitch_center_deg straight ahead)."""
         self._enter_search_mode()
         cfg = self.cfg
         t = now - self._search_start_time
         phase = 2.0 * math.pi * (t / max(1.0, cfg.search_gimbal_period_sec))
-        yaw_cmd = math.radians(cfg.search_gimbal_yaw_amp_deg) * math.sin(phase)
-        pitch_cmd = (
-            math.radians(cfg.search_gimbal_pitch_center_deg)
-            + math.radians(cfg.search_gimbal_pitch_amp_deg) * math.sin(0.5 * phase)
+        if self.target_received:
+            drone_x, drone_y, drone_z = self._drone_xyz()
+            target_x, target_y, target_z, _ = self._predicted_target(now)
+            aim = self.gimbal_ctrl.update(
+                drone_x=drone_x, drone_y=drone_y, drone_z=drone_z, drone_yaw=self._drone_yaw(),
+                target_x=target_x, target_y=target_y, target_z=target_z,
+            )
+            pitch_centre, yaw_centre = aim.pitch, aim.yaw
+        else:
+            pitch_centre, yaw_centre = math.radians(cfg.search_gimbal_pitch_center_deg), 0.0
+        ctrl = self.gimbal_ctrl
+        yaw_cmd = ctrl.clamp(
+            yaw_centre + math.radians(cfg.search_gimbal_yaw_amp_deg) * math.sin(phase),
+            -ctrl.max_yaw, ctrl.max_yaw,
+        )
+        pitch_cmd = ctrl.clamp(
+            pitch_centre + math.radians(cfg.search_gimbal_pitch_amp_deg) * math.sin(0.5 * phase),
+            ctrl.max_pitch_down, ctrl.max_pitch_up,
         )
         self.gimbal.send(pitch_cmd, yaw_cmd, now)
 

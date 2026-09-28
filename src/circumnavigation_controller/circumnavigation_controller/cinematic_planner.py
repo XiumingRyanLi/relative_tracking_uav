@@ -39,7 +39,12 @@ class CinematicPlanner:
         "back_right":  (-0.707, -0.707),
     }
 
-    def __init__(self):
+    def __init__(self, transition_speed: float = 5.0, transition_min_sec: float = 2.0):
+        # A new sequence first flies from the current shot point to its start
+        # point (see set_sequence) at this speed relative to the car.
+        self.transition_speed = transition_speed
+        self.transition_min_sec = transition_min_sec
+        self._has_flown = False
         self.queue = deque()
         self.current_action = None
         self.action_start_time = None
@@ -68,9 +73,33 @@ class CinematicPlanner:
         self.queue.append(action)
 
     def set_sequence(self, actions):
+        """Replace the queue. Once a shot has been flown, a transition to the
+        new sequence's start point goes first: jumping there made the drone
+        cut straight past (or at) the car, closer than DOPE can see it."""
+        actions = list(actions)
+        start = self._offset(actions[0], 0.0) if actions and self._has_flown else None
         self.clear()
+        if start is not None:
+            transition = self._make_transition(self.previous_offset, start)
+            if transition is not None:
+                self.add_action(transition)
         for action in actions:
             self.add_action(action)
+
+    def _make_transition(self, frm: CinematicOffset, to: CinematicOffset):
+        """Action flying around the car from `frm` to `to`, None if already there."""
+        r0, r1 = math.hypot(frm.x, frm.y), math.hypot(to.x, to.y)
+        th0, th1 = math.atan2(frm.y, frm.x), math.atan2(to.y, to.x)
+        dth = abs(math.atan2(math.sin(th1 - th0), math.cos(th1 - th0)))
+        length = 0.5 * (r0 + r1) * dth + abs(r1 - r0) + abs(to.z - frm.z)
+        if length < 0.5:
+            return None
+        return {
+            "type": "transition",
+            "from": (frm.x, frm.y, frm.z),
+            "to": (to.x, to.y, to.z),
+            "duration": max(self.transition_min_sec, length / max(self.transition_speed, 0.1)),
+        }
 
     @staticmethod
     def clamp01(u: float) -> float:
@@ -122,31 +151,8 @@ class CinematicPlanner:
         # Optional smoothing for cinematic motion
         s = u * u * (3.0 - 2.0 * u)
 
-        action_type = action.get("type", "hold_location")
-
-        if action_type == "hold_location":
-            offset = self._hold_location(action)
-
-        elif action_type == "move_location":
-            offset = self._move_location(action, s)
-
-        elif action_type == "orbit":
-            offset = self._orbit(action, s)
-
-        elif action_type == "overpass":
-            offset = self._overpass(action, s)
-
-        elif action_type == "push_in":
-            offset = self._push_pull(action, s, push=True)
-
-        elif action_type == "pull_out":
-            offset = self._push_pull(action, s, push=False)
-
-        else:
-            offset = self._hold_location(action)
-
-        # --------------------------- change offset depending on the camera model view
-        offset = self._enforce_min_range(offset, overhead_ok=(action_type == "overpass"))
+        offset = self._offset(action, s)
+        self._has_flown = True
 
         # If the current action has finished, mark this offset finished
         # and start the next action next cycle.
@@ -177,6 +183,50 @@ class CinematicPlanner:
     
 
 
+    def _offset(self, action: dict, s: float) -> CinematicOffset:
+        """Shot offset of `action` at smoothed progress s (0..1)."""
+        action_type = action.get("type", "hold_location")
+
+        if action_type == "hold_location":
+            offset = self._hold_location(action)
+        elif action_type == "move_location":
+            offset = self._move_location(action, s)
+        elif action_type == "orbit":
+            offset = self._orbit(action, s)
+        elif action_type == "overpass":
+            offset = self._overpass(action, s)
+        elif action_type == "push_in":
+            offset = self._push_pull(action, s, push=True)
+        elif action_type == "pull_out":
+            offset = self._push_pull(action, s, push=False)
+        elif action_type == "transition":
+            offset = self._transition(action, s)
+        else:
+            offset = self._hold_location(action)
+
+        # --------------------------- change offset depending on the camera model view
+        # (Overpass and transition climb rather than step outwards, which
+        # keeps their paths continuous.)
+        return self._enforce_min_range(
+            offset, overhead_ok=action_type in ("overpass", "transition")
+        )
+
+    def _transition(self, action: dict, s: float) -> CinematicOffset:
+        """Around the car, the short way: bearing, radius and height blend
+        from `from` to `to`, so the drone keeps its distance instead of
+        crossing the car."""
+        x0, y0, z0 = action["from"]
+        x1, y1, z1 = action["to"]
+        r0, r1 = math.hypot(x0, y0), math.hypot(x1, y1)
+        th1 = math.atan2(y1, x1)
+        th0 = math.atan2(y0, x0) if r0 > 0.5 else th1   # overhead: no bearing yet
+        if r1 <= 0.5:
+            th1 = th0
+        dth = math.atan2(math.sin(th1 - th0), math.cos(th1 - th0))
+        theta = th0 + dth * s
+        r = self.lerp(r0, r1, s)
+        return CinematicOffset(r * math.cos(theta), r * math.sin(theta), self.lerp(z0, z1, s))
+
     def _hold_location(self, action: dict) -> CinematicOffset:
         location = action.get("location", "back")
         radius = float(action.get("radius", self.default_radius))
@@ -186,43 +236,35 @@ class CinematicPlanner:
         return CinematicOffset(x, y, z)
 
     def _move_location(self, action: dict, s: float) -> CinematicOffset:
-        start_location = action.get("from", "back")
-        end_location = action.get("to", "front")
-        via = action.get("via", "left")
-
+        """Arc round the car at a constant radius and height from `from` to
+        `to`, on the side that passes `via` (a straight line between e.g.
+        back and left cut the corner to 0.7 x radius from the car)."""
         radius = float(action.get("radius", self.default_radius))
         height = float(action.get("height", self.default_height))
 
-        if start_location == "back" and end_location == "front":
-            side = 1.0 if via == "left" else -1.0
+        th0 = self._bearing(action.get("from", "back"))
+        th1 = self._bearing(action.get("to", "front"))
+        thv = self._bearing(action.get("via", "left"))
 
-            theta = math.pi * (1.0 - s)
+        two_pi = 2.0 * math.pi
+        ccw = (th1 - th0) % two_pi          # counter-clockwise sweep, 0..2pi
+        via_ccw = (thv - th0) % two_pi
+        eps = 1e-6
+        if ccw < eps:
+            sweep = 0.0                                  # from == to
+        elif eps < via_ccw < ccw - eps:
+            sweep = ccw                                  # via on the ccw side
+        elif via_ccw > ccw + eps:
+            sweep = ccw - two_pi                         # via on the cw side
+        else:
+            sweep = ccw if ccw <= math.pi else ccw - two_pi   # via is an end: short way
 
-            x = radius * math.cos(theta)
-            y = side * radius * math.sin(theta)
-            z = height
+        theta = th0 + sweep * s
+        return CinematicOffset(radius * math.cos(theta), radius * math.sin(theta), height)
 
-            return CinematicOffset(x, y, z)
-
-        if start_location == "front" and end_location == "back":
-            side = 1.0 if via == "left" else -1.0
-
-            theta = math.pi * s
-
-            x = radius * math.cos(theta)
-            y = side * radius * math.sin(theta)
-            z = height
-
-            return CinematicOffset(x, y, z)
-
-        x0, y0, z0 = self._location_to_offset(start_location, radius, height)
-        x1, y1, z1 = self._location_to_offset(end_location, radius, height)
-
-        x = self.lerp(x0, x1, s)
-        y = self.lerp(y0, y1, s)
-        z = self.lerp(z0, z1, s)
-
-        return CinematicOffset(x, y, z)
+    def _bearing(self, location: str) -> float:
+        ux, uy = self.LOCATIONS.get(location, self.LOCATIONS["back"])
+        return math.atan2(uy, ux)
 
     def _orbit(self, action: dict, s: float) -> CinematicOffset:
         radius = float(action.get("radius", self.default_radius))

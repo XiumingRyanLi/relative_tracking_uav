@@ -41,7 +41,7 @@ class PIDRelativeController:
         max_accel_xy: float = 5.0,
         max_accel_z: float = 2.0,
         derivative_tau: float = 0.3,
-        kp_xy: float = 0.80,
+        kp_xy: float = 0.60,
         ki_xy: float = 0.02,
         max_integral_xy: float = 3.0,
     ):

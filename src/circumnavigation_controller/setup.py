@@ -1,3 +1,5 @@
+from glob import glob
+
 from setuptools import find_packages, setup
 
 package_name = 'circumnavigation_controller'
@@ -20,6 +22,8 @@ setup(
             'config/gimbal_startup.parm',
             'config/guided_limits.parm',
         ]),
+        ('share/' + package_name + '/config/race_lines',
+            glob('config/race_lines/*.csv')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -36,7 +40,8 @@ setup(
             'camera_calibrate = circumnavigation_controller.camera_calibrate:main',
             'aruco_detector = circumnavigation_controller.aruco_detector:main',
             'dope_detector = circumnavigation_controller.dope_detector:main',
-            'cinematic_gui = circumnavigation_controller.cinematic_gui:main'
+            'cinematic_gui = circumnavigation_controller.cinematic_gui:main',
+            'race_driver = circumnavigation_controller.race_driver:main',
         ],
     },
 )

@@ -31,15 +31,21 @@ FIELD_SPECS = {
     "from":         {"kind": "location", "default": "back"},
     "to":           {"kind": "location", "default": "front"},
     "start":        {"kind": "location", "default": "back"},
-    "via":          {"kind": "enum", "options": ("left", "right"), "default": "left"},
+    # move_location goes round the car on the side that passes `via`
+    # (any location; the short way if it lies on neither side).
+    "via":          {"kind": "location", "default": "left"},
     "direction":    {"kind": "enum", "options": ("clockwise", "counterclockwise"), "default": "clockwise"},
-    "radius":       {"kind": "float", "bounds": (0.5, 15.0), "default": 3.0, "unit": " m"},
-    "height":       {"kind": "float", "bounds": (0.5, 20.0), "default": 3.0, "unit": " m"},
-    "start_height": {"kind": "float", "bounds": (0.5, 20.0), "default": 3.0, "unit": " m"},
-    "peak_height":  {"kind": "float", "bounds": (0.5, 20.0), "default": 6.0, "unit": " m"},
-    "end_height":   {"kind": "float", "bounds": (0.5, 20.0), "default": 3.0, "unit": " m"},
-    "near_radius":  {"kind": "float", "bounds": (0.5, 15.0), "default": 3.0, "unit": " m"},
-    "far_radius":   {"kind": "float", "bounds": (0.5, 15.0), "default": 8.0, "unit": " m"},
+    # Distance limits: DOPE was trained on 4-45 m views, so shots out to
+    # ~50 m stay detectable (was capped at 15 m radius / 20 m height, which
+    # also stopped typing larger values in the GUI). The planner still keeps
+    # every shot >= MIN_TARGET_RANGE (10 m) from the car.
+    "radius":       {"kind": "float", "bounds": (0.5, 50.0), "default": 3.0, "unit": " m"},
+    "height":       {"kind": "float", "bounds": (0.5, 30.0), "default": 3.0, "unit": " m"},
+    "start_height": {"kind": "float", "bounds": (0.5, 30.0), "default": 3.0, "unit": " m"},
+    "peak_height":  {"kind": "float", "bounds": (0.5, 30.0), "default": 6.0, "unit": " m"},
+    "end_height":   {"kind": "float", "bounds": (0.5, 30.0), "default": 3.0, "unit": " m"},
+    "near_radius":  {"kind": "float", "bounds": (0.5, 50.0), "default": 3.0, "unit": " m"},
+    "far_radius":   {"kind": "float", "bounds": (0.5, 50.0), "default": 8.0, "unit": " m"},
     "angle_deg":    {"kind": "float", "bounds": (0.0, 360.0), "default": 180.0, "unit": " deg"},
     "duration":     {"kind": "float", "bounds": (0.1, 300.0), "default": 8.0, "unit": " s"},
 }

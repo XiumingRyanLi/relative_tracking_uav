@@ -94,10 +94,18 @@ def main():
 
     if args.no_show:
         matplotlib.use("Agg")
-    fig, ax = plt.subplots(3, 2, figsize=(15, 12))
+    # Left: range, position error, heading error. Right: range error vs
+    # range, then the top-down tracks over two rows.
+    fig = plt.figure(figsize=(15, 12))
+    gs = fig.add_gridspec(3, 2)
+    ax_range = fig.add_subplot(gs[0, 0])
+    ax_range_err = fig.add_subplot(gs[0, 1])
+    ax_pos_err = fig.add_subplot(gs[1, 0])
+    ax_heading = fig.add_subplot(gs[2, 0])
+    ax_tracks = fig.add_subplot(gs[1:, 1])
     fig.suptitle(f"DOPE vs ground truth  ({os.path.basename(path)}, detections <= {args.max_age:.2f} s old)")
 
-    a = ax[0, 0]
+    a = ax_range
     a.plot(df.loc[have_truth, "t"], df.loc[have_truth, "gt_dist_m"], "k-", lw=1, label="truth range")
     a.plot(ev["t"], ev["dope_dist_m"], "g.", ms=3, label="DOPE range")
     a.set_xlabel("time [s]"); a.set_ylabel("range [m]"); a.set_title("Range: DOPE vs truth"); a.legend(); a.grid(alpha=0.3)
@@ -105,7 +113,7 @@ def main():
     # One dot per scored row: how far DOPE's range was off (DOPE - truth,
     # + = DOPE says too far) at that true distance. A car parked at a
     # fixed distance stacks all its rows into one vertical stripe.
-    a = ax[0, 1]
+    a = ax_range_err
     sc = a.scatter(ev["gt_dist_m"], ev["dope_dist_err_m"], s=6, c=ev["t"], cmap="viridis")
     fig.colorbar(sc, ax=a, label="time [s]")
     a.axhline(0, color="k", lw=0.8)
@@ -115,11 +123,16 @@ def main():
     a.legend(loc="upper left")
     a.set_xlabel("truth range [m]"); a.set_ylabel("DOPE - truth range [m]"); a.set_title("Range error vs range"); a.grid(alpha=0.3)
 
-    a = ax[1, 0]
-    a.plot(ev["t"], ev["dope_pos_err_m"], "r.", ms=3)
+    # As a line, broken wherever there was no fresh detection for > 1 s
+    # rather than drawn straight across the gap.
+    a = ax_pos_err
+    t_err = ev["t"].to_numpy(dtype=float)
+    pos_err = ev["dope_pos_err_m"].to_numpy(dtype=float)
+    gap = np.flatnonzero(np.diff(t_err) > 1.0) + 1
+    a.plot(np.insert(t_err, gap, np.nan), np.insert(pos_err, gap, np.nan), "r-", lw=1)
     a.set_xlabel("time [s]"); a.set_ylabel("3D position error [m]"); a.set_title("World-frame target position error"); a.grid(alpha=0.3)
 
-    a = ax[1, 1]
+    a = ax_heading
     a.plot(ev["t"], ev["dope_yaw_err_deg"], "b.", ms=3)
     a.axhline(0, color="k", lw=0.8)
     a.set_ylim(-180, 180)
@@ -128,7 +141,7 @@ def main():
     # Where things were, seen from above. Grey lines join each DOPE
     # estimate to where the car really was at that moment, so their length
     # is the horizontal position error.
-    a = ax[2, 0]
+    a = ax_tracks
     for _, row in ev.iloc[::5].iterrows():
         a.plot([row["target_x"], row["car_gt_x"]], [row["target_y"], row["car_gt_y"]], "-", color="0.8", lw=0.5, zorder=1)
     a.plot(df["drone_x"], df["drone_y"], "c-", lw=1, label="drone")
@@ -140,12 +153,6 @@ def main():
     a.plot(ev["target_x"], ev["target_y"], "g.", ms=3, label="DOPE target", zorder=3)
     a.set_aspect("equal", adjustable="datalim")
     a.set_xlabel("east [m]"); a.set_ylabel("north [m]"); a.set_title("Top-down tracks (world frame)"); a.legend(fontsize=8); a.grid(alpha=0.3)
-
-    a = ax[2, 1]
-    err = ev["dope_dist_err_m"].to_numpy()
-    a.hist(err[np.isfinite(err)], bins=40, color="g", alpha=0.7)
-    a.axvline(0, color="k", lw=0.8)
-    a.set_xlabel("range error [m]"); a.set_ylabel("rows"); a.set_title("Range error distribution"); a.grid(alpha=0.3)
 
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     out = os.path.splitext(path)[0] + "_dope_eval.png"

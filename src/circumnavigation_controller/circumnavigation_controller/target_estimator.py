@@ -7,8 +7,13 @@ camera_frames.py) goes through:
   2. a constant-velocity linear KF on position -> position + velocity;
   3. heading - a jump-gated circular EMA of the detector's heading plus a
      yaw rate from its smoothed derivative, or optionally a CTRV UKF.
+With use_ctra (target_filter=ctra, the default) the CV KF is not used: a
+heading-aided CTRA EKF (target_ctra_ekf.py) gates detections on its own
+prediction (chi-square), and gives x, y, velocity, acceleration, heading and
+yaw rate; see _update_ctra_pipeline.
 """
 import math
+from collections import deque
 from dataclasses import dataclass
 from typing import Optional
 
@@ -16,10 +21,12 @@ import numpy as np
 
 try:
     from .geometry import angle_diff, smooth_angle, wrap_to_pi
+    from .target_ctra_ekf import TargetCTRAEKF
     from .target_ctrv_ukf import TargetCTRVUKF
     from .target_kalman_filter import TargetKalmanFilter
 except ImportError:
     from geometry import angle_diff, smooth_angle, wrap_to_pi
+    from target_ctra_ekf import TargetCTRAEKF
     from target_ctrv_ukf import TargetCTRVUKF
     from target_kalman_filter import TargetKalmanFilter
 
@@ -67,7 +74,17 @@ class TargetEstimator:
         max_heading_jump: float,
         max_heading_distance: float,
         enable_heading_filter: bool,
+        heading_course_min_speed: float,
+        heading_flip_threshold: float,
+        heading_course_memory_sec: float,
         enable_heading_ukf: bool,
+        use_ctra: bool = False,
+        ctra_gate_nis: float = 25.0,
+        course_window_sec: float = 1.0,
+        z_alpha: float = 0.3,
+        ctra_s_wdot: float = 0.2,
+        ctra_s_jerk: float = 0.5,
+        ctra_heading_std: float = math.radians(4.0),
         ukf_coast_timeout_sec: float,
         ukf_std_a: float,
         ukf_std_yawdd: float,
@@ -91,6 +108,9 @@ class TargetEstimator:
         self.max_heading_jump = max_heading_jump
         self.max_heading_distance = max_heading_distance
         self.enable_heading_filter = enable_heading_filter
+        self.heading_course_min_speed = heading_course_min_speed
+        self.heading_flip_threshold = heading_flip_threshold
+        self.heading_course_memory_sec = heading_course_memory_sec
         self.enable_heading_ukf = enable_heading_ukf
         self.ukf_coast_timeout_sec = ukf_coast_timeout_sec
 
@@ -104,6 +124,16 @@ class TargetEstimator:
             adaptive_q_max_scale=kf_adaptive_q_max_scale,
             adaptive_q_decay=kf_adaptive_q_decay,
         )
+        self.use_ctra = use_ctra
+        self.ctra_gate_nis = ctra_gate_nis
+        self.course_window_sec = course_window_sec
+        self.z_alpha = z_alpha
+        self._course_window = deque()   # (stamp, x, y) of accepted raw positions
+        self.ctra = TargetCTRAEKF(
+            s_wdot=ctra_s_wdot, s_jerk=ctra_s_jerk, heading_std=ctra_heading_std,
+            max_speed=kf_max_target_speed, max_turn_rate=max_yaw_rate,
+        )
+        self._ctra_last_update_time = None
         self.ukf = TargetCTRVUKF(
             std_a=ukf_std_a,
             std_yawdd=ukf_std_yawdd,
@@ -119,6 +149,8 @@ class TargetEstimator:
         self._filtered_heading = 0.0
         self._yaw_rate_lpf = 0.0
         self._prev_heading_stamp = None
+        self.heading_flips = 0          # DOPE headings turned round by the course check
+        self._course = None             # (direction of travel rad, stamp) at speed
 
         # ---- Estimate (world ENU) ----
         self.x, self.y, self.z = 0.0, 3.0, 0.0
@@ -126,6 +158,8 @@ class TargetEstimator:
         # filter has seen at least two measurements.
         self.vx, self.vy, self.vz = 0.0, 0.0, 0.0
         self.heading = 0.0
+        # World-frame acceleration (m/s^2); only estimated by the CTRA EKF.
+        self.ax, self.ay = 0.0, 0.0
         # Yaw rate (rad/s), only estimated by the UKF.
         self.yaw_rate = 0.0
 
@@ -145,6 +179,8 @@ class TargetEstimator:
         latency jitter doesn't show up in the velocity as spurious acceleration.
         """
         meas = T_world_target[:3, 3].copy()
+        if self.use_ctra:
+            return self._update_ctra_pipeline(T_world_target, meas, distance, stamp_sec)
         kf_fresh = (
             self._kf_last_update_time is not None
             and (stamp_sec - self._kf_last_update_time) <= self.kf_coast_timeout_sec
@@ -196,11 +232,128 @@ class TargetEstimator:
 
         # ---- 3. Heading ----
         raw_heading = wrap_to_pi(self.raw_heading(T_world_target))
+        # (Checked against the KF velocity, which doesn't depend on the
+        # heading, so a flipped heading can't confirm itself.)
+        raw_heading = self._resolve_heading_flip(raw_heading, stamp_sec, (self.vx, self.vy))
         if not self.enable_heading_ukf:
             self._update_heading_ema(raw_heading, kf_fresh, reseed, stamp_sec)
         else:
             self._update_heading_ukf(raw_heading, distance, stamp_sec)
         return None
+
+    def _resolve_heading_flip(self, raw_heading, stamp_sec, course_velocity):
+        """DOPE sometimes reads the car nose-to-tail (~180 deg off, mostly at
+        long range). A moving car drives the way it points, so a heading
+        more than heading_flip_threshold from the direction of travel is
+        turned round. In runs 20260928_134234/145616/150220/142126 flipped
+        readings were >= 127 deg off the course and correct ones <= 86 deg.
+
+        The direction of travel is remembered for heading_course_memory_sec:
+        a KF re-seed zeroes the velocity, and right after one the old gate
+        let a flipped heading straight in (run 20260928_145616, t=91 s)."""
+        vx, vy = course_velocity
+        if math.hypot(vx, vy) >= self.heading_course_min_speed:
+            self._course = (math.atan2(vy, vx), stamp_sec)
+        if self._course is None or stamp_sec - self._course[1] > self.heading_course_memory_sec:
+            return raw_heading
+        if abs(angle_diff(raw_heading, self._course[0])) > self.heading_flip_threshold:
+            self.heading_flips += 1
+            return wrap_to_pi(raw_heading + math.pi)
+        return raw_heading
+
+    def _update_ctra_pipeline(self, T_world_target, meas, distance, stamp_sec) -> Optional[str]:
+        """target_filter=ctra: the CTRA EKF alone, no CV KF.
+
+        1. gate: range, then a chi-square gate on the EKF's own predicted
+           position and its uncertainty (NIS > ctra_gate_nis is rejected).
+           It widens by itself after gaps and in corners, where a fixed
+           distance from a straight-line prediction rejected good frames;
+        2. direction of travel for the flip check from a straight-line fit
+           through the last course_window_sec of accepted raw positions --
+           independent of the heading, so a flipped heading can't confirm
+           itself through the EKF's velocity;
+        3. CTRA EKF update; z is a light EMA of the measured z.
+        """
+        if not (self.min_distance <= distance <= self.max_distance):
+            self._reject_count += 1
+            return f"range {distance:.1f} m outside [{self.min_distance:.1f}, {self.max_distance:.1f}]"
+        ekf = self.ctra
+        r_std = self.kf.r_std + self.noise_per_m * distance
+        last = self._ctra_last_update_time
+        fresh = ekf.initialized and last is not None and 0.0 <= stamp_sec - last <= self.kf_coast_timeout_sec
+        if fresh and self._reject_count < self.max_consecutive_rejects:
+            nis = ekf.position_nis(float(meas[0]), float(meas[1]), r_std, stamp_sec - last)
+            if nis > self.ctra_gate_nis:
+                self._reject_count += 1
+                return f"NIS {nis:.1f} > gate {self.ctra_gate_nis:.1f} (EKF prediction)"
+        # After max_consecutive_rejects drops in a row, accept and re-seed so
+        # a filter that latched onto a bad value cannot lock the target out.
+        reseed = self._reject_count >= self.max_consecutive_rejects
+        self._reject_count = 0
+
+        window = self._course_window
+        if not fresh or reseed:
+            window.clear()
+        window.append((stamp_sec, float(meas[0]), float(meas[1])))
+        while stamp_sec - window[0][0] > self.course_window_sec:
+            window.popleft()
+        course_velocity = (0.0, 0.0)
+        if len(window) >= 4 and window[-1][0] - window[0][0] >= 0.4 * self.course_window_sec:
+            w = np.array(window)
+            t = w[:, 0] - w[:, 0].mean()
+            denom = float(t @ t)
+            course_velocity = (float(t @ w[:, 1]) / denom, float(t @ w[:, 2]) / denom)
+
+        raw_heading = wrap_to_pi(self.raw_heading(T_world_target))
+        raw_heading = self._resolve_heading_flip(raw_heading, stamp_sec, course_velocity)
+        self._update_ctra(meas, r_std, raw_heading, fresh and not reseed, stamp_sec)
+        self.z = float(meas[2]) if not fresh else self.z + self.z_alpha * (float(meas[2]) - self.z)
+        self.vz = 0.0
+        if not self.use_filtered_position:
+            self.x, self.y = float(meas[0]), float(meas[1])
+        return None
+
+    def _update_ctra(self, meas, pos_std, raw_heading, fresh, stamp_sec):
+        """Heading-aided CTRA EKF -> x, y, velocity, acceleration, heading,
+        yaw rate. A heading far off the prediction (a bad frame DOPE didn't
+        flip cleanly) updates the position only; if that persists, the
+        filter is the one that is wrong and restarts on the measurement."""
+        ekf = self.ctra
+        if not fresh or not ekf.initialized:
+            # Carry the speed across a short loss (KF re-seed zeroes its own).
+            recent = (self._ctra_last_update_time is not None
+                      and stamp_sec - self._ctra_last_update_time <= self.heading_course_memory_sec)
+            speed = ekf.speed if (recent and ekf.initialized) else 0.0
+            ekf.reset(float(meas[0]), float(meas[1]), raw_heading, speed,
+                      speed_std=3.0 if speed > 0.0 else None)
+            self._heading_reject_count = 0
+        else:
+            ekf.predict(stamp_sec - self._ctra_last_update_time)
+            psi = raw_heading
+            if abs(angle_diff(raw_heading, ekf.heading)) > self.max_heading_jump:
+                self._heading_reject_count += 1
+                psi = None
+            else:
+                self._heading_reject_count = 0
+            if self._heading_reject_count > self.max_consecutive_rejects:
+                ekf.reset(float(meas[0]), float(meas[1]), raw_heading, ekf.speed, speed_std=3.0)
+                self._heading_reject_count = 0
+            else:
+                ekf.update(float(meas[0]), float(meas[1]), pos_std, psi)
+        self._ctra_last_update_time = stamp_sec
+
+        if self.use_filtered_position:
+            self.x, self.y = ekf.x, ekf.y
+        self.vx, self.vy = ekf.velocity()
+        self.ax, self.ay = ekf.acceleration()
+        self.heading = ekf.heading
+        # Same low-speed fade as the EMA path: a car can't turn in place.
+        speed = ekf.speed
+        if self.yaw_rate_min_speed > 0.0:
+            fade = min(1.0, max(0.0, (speed - self.yaw_rate_min_speed) / self.yaw_rate_min_speed))
+        else:
+            fade = 1.0
+        self.yaw_rate = max(-self.max_yaw_rate, min(self.max_yaw_rate, ekf.turn_rate * fade))
 
     def _update_heading_ema(self, raw_heading: float, kf_fresh: bool, reseed: bool, stamp_sec: float):
         """Raw heading, or with enable_heading_filter a jump-gated circular EMA

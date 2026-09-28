@@ -54,7 +54,7 @@
             <visual name="base_link_visual">
                 <!-- The exported mesh has its nose along -x (checked with a
                      Blender preview render), so yaw by 180 deg to put the
-                     nose along +x, which DiffDrive treats as forward. -->
+                     nose along +x, which the steering plugin treats as forward. -->
                 <pose>0 0 0 0 0 3.14159265358979</pose>
                 <geometry>
                     <mesh>
@@ -80,6 +80,36 @@
                 <cast_shadows>false</cast_shadows>
             </visual>
         </link>
+        <!-- Steering knuckle: base_link -> (steer about z) -> knuckle -> (spin about y) -> wheel -->
+        <link name="front_left_steering">
+            <pose>1.325 0.82 0.335 0 0 0</pose>
+            <inertial>
+                <mass>2</mass>
+                <inertia>
+                    <ixx>0.01</ixx>
+                    <ixy>0</ixy>
+                    <ixz>0</ixz>
+                    <iyy>0.01</iyy>
+                    <iyz>0</iyz>
+                    <izz>0.01</izz>
+                </inertia>
+            </inertial>
+        </link>
+        <joint name="front_left_steering_joint" type="revolute">
+            <parent>base_link</parent>
+            <child>front_left_steering</child>
+            <axis>
+                <xyz>0 0 1</xyz>
+                <limit>
+                    <lower>-0.6</lower>
+                    <upper>0.6</upper>
+                    <!-- Effort limit so velocity control respects the angle
+                         limits; velocity = max steering rate (rad/s). -->
+                    <effort>1000000</effort>
+                    <velocity>1.0</velocity>
+                </limit>
+            </axis>
+        </joint>
         <link name="front_left_wheel">
             <pose>1.325 0.82 0.335 0 0 0</pose>
             <inertial>
@@ -115,7 +145,7 @@
             </collision>
         </link>
         <joint name="front_left_wheel_joint" type="revolute">
-            <parent>base_link</parent>
+            <parent>front_left_steering</parent>
             <child>front_left_wheel</child>
             <axis>
                 <xyz>0 1 0</xyz>
@@ -126,6 +156,36 @@
             </axis>
         </joint>
 
+        <!-- Steering knuckle: base_link -> (steer about z) -> knuckle -> (spin about y) -> wheel -->
+        <link name="front_right_steering">
+            <pose>1.325 -0.82 0.335 0 0 0</pose>
+            <inertial>
+                <mass>2</mass>
+                <inertia>
+                    <ixx>0.01</ixx>
+                    <ixy>0</ixy>
+                    <ixz>0</ixz>
+                    <iyy>0.01</iyy>
+                    <iyz>0</iyz>
+                    <izz>0.01</izz>
+                </inertia>
+            </inertial>
+        </link>
+        <joint name="front_right_steering_joint" type="revolute">
+            <parent>base_link</parent>
+            <child>front_right_steering</child>
+            <axis>
+                <xyz>0 0 1</xyz>
+                <limit>
+                    <lower>-0.6</lower>
+                    <upper>0.6</upper>
+                    <!-- Effort limit so velocity control respects the angle
+                         limits; velocity = max steering rate (rad/s). -->
+                    <effort>1000000</effort>
+                    <velocity>1.0</velocity>
+                </limit>
+            </axis>
+        </joint>
         <link name="front_right_wheel">
             <pose>1.325 -0.82 0.335 0 0 0</pose>
             <inertial>
@@ -161,7 +221,7 @@
             </collision>
         </link>
         <joint name="front_right_wheel_joint" type="revolute">
-            <parent>base_link</parent>
+            <parent>front_right_steering</parent>
             <child>front_right_wheel</child>
             <axis>
                 <xyz>0 1 0</xyz>
@@ -266,27 +326,43 @@
 
         <!-- ============================================================
              DRIVE + ODOMETRY PLUGINS
-             DiffDrive's <topic>cmd_vel</topic> is NOT model-scoped: the car
-             listens on the bare /cmd_vel gz topic (verified). Drive it with:
+             Ackermann steering with Audi R8 dimensions: rear-wheel drive,
+             front wheels steered (wheelbase 2.65 m, track 1.64 m, kingpin
+             width 1.44 m, max wheel angle 0.5 rad ~ 29 deg -> ~5.5 m minimum
+             turning radius). Speed is acceleration- and jerk-limited
+             (accelerate <= 3 m/s^2, brake <= 6 m/s^2), so the car behaves like
+             a double integrator: it can't stop, start or turn on the spot.
+             A /cmd_vel Twist gives the target speed (linear.x) and yaw rate
+             (angular.z); the yaw rate is turned into a steering angle, so the
+             car only turns while moving. It listens on the bare /cmd_vel gz
+             topic (as the DiffDrive did):
              gz topic -t /cmd_vel -m gz.msgs.Twist \
-               -p "linear: {x: 2.0}, angular: {z: 0.3}"
+               -p "linear: {x: 5.0}, angular: {z: 0.3}"
              Ground truth comes from OdometryPublisher on its default topic
              /model/<world model name>/odometry, i.e.
              /model/LandingVehicle/odometry with iris_runway_new.sdf: the
-             true world pose. DiffDrive also defaults to that topic, but its
-             odometry is wheel dead-reckoning from (0,0) facing +x, so it is
-             moved to /audi_r8/wheel_odometry -- two publishers on one topic
-             made the logged truth jump between two different poses.
+             true world pose. The steering plugin's own (dead-reckoned)
+             odometry is moved to /audi_r8/wheel_odometry so the two never
+             share a topic.
              ============================================================ -->
         <plugin
-            filename="gz-sim-diff-drive-system"
-            name="gz::sim::systems::DiffDrive">
-            <left_joint>front_left_wheel_joint</left_joint>
+            filename="gz-sim-ackermann-steering-system"
+            name="gz::sim::systems::AckermannSteering">
             <left_joint>rear_left_wheel_joint</left_joint>
-            <right_joint>front_right_wheel_joint</right_joint>
             <right_joint>rear_right_wheel_joint</right_joint>
+            <left_steering_joint>front_left_steering_joint</left_steering_joint>
+            <right_steering_joint>front_right_steering_joint</right_steering_joint>
+            <kingpin_width>1.44</kingpin_width>
+            <steering_limit>0.5</steering_limit>
+            <wheel_base>2.65</wheel_base>
             <wheel_separation>1.64</wheel_separation>
             <wheel_radius>0.335</wheel_radius>
+            <min_velocity>-8</min_velocity>
+            <max_velocity>30</max_velocity>
+            <min_acceleration>-6</min_acceleration>
+            <max_acceleration>3</max_acceleration>
+            <min_jerk>-15</min_jerk>
+            <max_jerk>15</max_jerk>
             <odom_publish_frequency>20</odom_publish_frequency>
             <odom_topic>/audi_r8/wheel_odometry</odom_topic>
             <topic>cmd_vel</topic>

@@ -94,6 +94,8 @@ The launch opens one terminal per process:
 | 10 s | ArduPilot SITL (`sim_vehicle.py`, MAVProxy with `--streamrate=20`) |
 | 40 s | MAVROS, detector (DOPE or ArUco), `relative_position_controller`, cinematic GUI |
 
+All ROS nodes run on the Gazebo `/clock` (`use_sim_time:=true`, the default). The camera images carry sim-time stamps, so the controller can only look up the drone pose and gimbal angle at frame-capture time when it, MAVROS and the detector share that clock; on wall time it warned `history match ... from capture time` on every frame and used the live values.
+
 - SITL waits 10 s for Gazebo (`GAZEBO_STARTUP_DELAY_SEC`): if it connects before Gazebo has set up
   its renderer, the lock-step link deadlocks ("No JSON sensor message received, resending servos" /
   "Duplicate input frame" and an empty Gazebo window).
@@ -155,9 +157,67 @@ The GStreamer stream on UDP 5600 only starts after
 
 ### Controlling the car
 
+The Audi (`models/audi_r8`, also in `~/ardupilot_gazebo/models/audi_r8`, keep both in sync) drives like
+a real car: Ackermann steering (rear-wheel drive, steered front wheels, wheelbase 2.65 m, track 1.64 m,
+max wheel angle 0.5 rad, ~5.5 m minimum turning radius) with acceleration-limited speed
+(accelerate <= 3 m/s², brake <= 6 m/s², jerk <= 15 m/s³). `linear.x` is the target speed and
+`angular.z` the target yaw rate, which becomes a steering angle, so the car only turns while moving
+and can't stop or start instantly.
+
 ```bash
-gz topic -t /cmd_vel -m gz.msgs.Twist -p "linear: {x:1.0}, angular: {z: 0.0}"
+gz topic -t /cmd_vel -m gz.msgs.Twist -p "linear: {x: 5.0}, angular: {z: 0.0}"   # drive straight
+gz topic -t /cmd_vel -m gz.msgs.Twist -p "linear: {x: 5.0}, angular: {z: 0.3}"   # turn (R = v / w ~ 17 m)
+gz topic -t /cmd_vel -m gz.msgs.Twist -p "linear: {x: 0.0}, angular: {z: 0.0}"   # brake to a stop
 ```
+
+Measured in Gazebo: 0 -> 8 m/s in ~2.7 s, 8 m/s with 0.4 rad/s commanded turns at ~21-22 deg/s, stops
+from 8 m/s in ~2 s, and a turn command at standstill does nothing.
+
+### Racing the car round a track
+
+`race_driver` drives the car round a track world like a racing driver: flat out on the straights
+(15 m/s, the drone's guided speed limit), braking into corners and accelerating out of them. It
+follows a minimum-curvature racing line with pure pursuit and waits until the drone has taken off
+and hovered before it starts.
+
+```bash
+ros2 launch circumnavigation_controller sim_launch.py world:=iris_silverstone race:=true
+# or on its own (e.g. with the sim already running), without waiting for the drone:
+ros2 run circumnavigation_controller race_driver --ros-args -p world:=iris_monza -p wait_for_drone:=false
+```
+
+| World | Lap | Lap time in Gazebo | Corner speeds |
+|---|---|---|---|
+| `iris_oschersleben` | 1.2 km | ~122 s | 6-9 m/s (slowest 5.7) |
+| `iris_silverstone` | 1.9 km | ~177 s | 6-9 m/s (slowest 3.5, the hairpin) |
+| `iris_monza` | 2.2 km | ~176 s | 6-9 m/s (slowest 4.7) |
+
+Parameters: `max_speed` (15 m/s), `lat_accel` (2.5 m/s², cornering), `accel` (2.0 m/s²),
+`brake` (4.0 m/s²), `min_speed` (3 m/s), `laps` (0 = keep going, else stop after N), `wait_for_drone`
+(true), `start_altitude` (2.5 m), `start_delay` (6 s after reaching it). Lap times are logged.
+
+`speed_zones` caps the speed on stretches of the lap, as flat triples `[s_start, s_end, max_speed, ...]`
+(metres along the lap from the start line, decimals required; `s_end < s_start` wraps past the line).
+The car brakes into each zone in time and accelerates out. At startup `race_driver` logs every corner
+with its `s`, speed and radius to pick zones from:
+
+```bash
+ros2 run circumnavigation_controller race_driver --ros-args -p world:=iris_oschersleben \
+  -p speed_zones:="[280.0, 330.0, 4.0, 1050.0, 1100.0, 4.5]"
+```
+
+- The speed profile is the usual lap-time-simulator recipe: corner speed `sqrt(lat_accel /
+  curvature)`, then forward (acceleration) and backward (braking) passes, with a friction circle so
+  the car doesn't accelerate hard while still cornering.
+- Don't raise `lat_accel` or `accel` much: the rear-drive Audi spins out in Gazebo (power oversteer
+  on corner exit) and its steering is slow (AckermannSteering `steer_p_gain` defaults to 1, a ~1 s
+  steering lag). Both were tuned in Gazebo on all three tracks, down from 3-4 m/s², which crashed.
+- Pure pursuit steers from the car's direction of travel (yaw plus slip from the odometry's lateral
+  velocity), not its nose: the car fishtails at ~1 Hz after any steering input, and chasing the nose
+  kept that going as a constant weave on the straights (yaw rate ±12 deg/s, now ~2 deg/s).
+- Racing lines live in `config/race_lines/<world>.csv`, made by `tools/build_race_lines.py` from each
+  world's track mesh and pose (run it with `/usr/bin/python3`; `--plot` saves a picture). Re-run it
+  and rebuild after moving or rescaling a track in its world file.
 
 ### Controlling the gimbal
 
@@ -210,6 +270,7 @@ an overpass climbs instead, so its path stays continuous and it can fly straight
 | `flight_sequencer.py` | logistics | GUIDED -> arm -> takeoff -> hover -> tracking, safety RTL |
 | `gimbal_interface.py` | logistics | MAVROS gimbal manager commands and attitude feedback |
 | `run_logger.py` | logging | CSV log, ground-truth evaluation columns, `[chain]` transform debug line |
+| `race_driver.py`, `race_line.py` | sim | race-track car driver node; racing line, speed profile and pure pursuit |
 | `geometry.py` | shared | angle and frame helpers |
 | `target_kalman_filter.py`, `target_ctrv_ukf.py` | filters | CV Kalman filter; CTRV UKF (off by default, see below) |
 
@@ -226,11 +287,18 @@ an overpass climbs instead, so its path stays continuous and it can fly straight
 | `enable_shot_rotation_feedforward` | true | adds yaw rate x shot offset; removed most of the sideways lag in turns (4 m -> 1.2 m at 4 deg/s) |
 | `yaw_rate_tau_sec` / `yaw_rate_min_speed` | 1.0 s / 1.0 m/s | yaw rate = smoothed heading derivative, 0 below 1 m/s, full from 2 m/s (0.5 let heading noise on a parked car through) |
 | `max_rotation_feedforward` | 5 m/s | cap on yaw rate x shot offset; noise had pushed the drone sideways at 5+ m/s |
-| `feedforward_timeout_sec` | 0.5 s | no feedforward or heading prediction once the last detection is older than this (the estimate's motion is frozen during a loss) |
+| `feedforward_timeout_sec` | 0.5 s | a detection older than this starts COAST: shot heading frozen (no rotation feedforward or heading prediction), drone holds its current height, shot sequence paused until re-acquisition |
+| `coast_full_speed_sec` / `coast_taper_sec` / `coast_max_distance` | 2 s / 1 s / 20 m | while coasting, the target (drone setpoint and gimbal aim) is carried on at its last velocity for 2 s, slowed to a stop over 1 s and never moved more than 20 m; after `target_timeout_sec` (10 s) it searches. The CSV `stage` column reads `coast` |
+| `shot_transition_speed` / `shot_transition_min_sec` | 5 m/s / 2 s | a new GUI sequence first flies around the car (bearing, radius and height blended, the short way) from the current shot point to the sequence's start point; jumping there had the drone cut past the car at 8 m and lose it (run 20260928_120132) |
+| `move_location` (shot) | — | arcs round the car at a constant radius and height, on the side that passes `via` (any location; the short way if `via` is one of the ends). It used to be a straight line except for back<->front, which cut the corner to 0.7 x radius |
+| `enable_search_mode` / `search_altitude` | true / 20 m | SEARCH after `target_timeout_sec`: climb to 20 m where the drone is, face the last estimate and sweep the gimbal around it (±75 deg yaw, ±15 deg pitch). False hovers in place instead. CSV `stage` = `search` (or `hold`) |
 | `gimbal_kp_yaw`, `gimbal_kd_yaw`, `gimbal_yaw_deadband_deg`, `gimbal_max_yaw_step_deg` | 0.4, 0, 0.5, 8 | less yaw jitter without big overshoot when the body turns fast |
 | `gimbal_max_pitch_down_deg` / `gimbal_max_yaw_deg` | -135 / ±160 deg | the mount's real range (was -80 / ±90 in code, so the camera could never look straight down); below -90 it looks backwards, so an overhead pass needs no 180 deg yaw flip |
 | `yaw_hold_radius` | 5 m | the drone holds its body yaw when nearly above the car, where the bearing flips 180 deg |
 | `gimbal_detection_timeout_sec` | 0.5 s | each detection steers the gimbal once; after 0.5 s without one the gimbal points at the car's estimated position instead (re-applying the old error drove it to its pitch limit, e.g. into the sky) |
+| `heading_flip_threshold_deg` / `heading_course_min_speed` / `heading_course_memory_sec` | 110 deg / 3 m/s / 3 s | DOPE sometimes reads the car nose-to-tail at long range; a heading more than 110 deg from the direction of travel is turned round 180 deg (flips were >= 127 deg off, correct readings <= 86 deg, 4 race runs). The direction of travel is remembered for 3 s so a KF re-seed can't let a flip in (run 20260928_145616 lost the car that way) |
+| (latency) | — | the target estimate is carried on from the frame's capture stamp, not its arrival: it trailed the car by 0.7-0.8 m at 11 m/s. Falls back to arrival time if the stamp is in another clock domain |
+| `target_filter` | ctra | heading-aided CTRA EKF (`target_ctra_ekf.py`: x, y, heading, speed, turn rate, along-track accel; measures DOPE position + flip-resolved heading) for the target position, velocity, acceleration, heading and yaw rate. The CV KF is not used: detections are gated by a chi-square test on the EKF's own prediction (`ctra_gate_nis` 25; the textbook 13.8 rejected 10 % of good frames because DOPE's drifting bias makes the EKF overconfident), the flip check's direction of travel comes from a line fit through the last 1 s of raw positions (independent of the heading), and z is an EMA of the measured z. `cv` = the previous KF + fixed jump gate + heading EMA. `scripts/benchmark_target_filter.py` (race-line truth, DOPE-like noise, held-out tracks): median error 15 % lower now, 28-34 % lower 1-2 s ahead, 38 % on velocity, 28 % on heading, and 1.7 % of 5-15 m outliers accepted vs 6.8 %. Tuning: `ctra_turn_rate_noise` 0.2, `ctra_jerk_noise` 0.5, `ctra_heading_std_deg` 4 |
 | `enable_heading_ukf` | false | the CTRV UKF flips its heading by 180 deg in turns with DOPE-level noise (crash bug fixed, filter still not usable) |
 
 Things that were tried and made it worse: `PSC_NE_JERK 20` (removed damping; the drone oscillated
