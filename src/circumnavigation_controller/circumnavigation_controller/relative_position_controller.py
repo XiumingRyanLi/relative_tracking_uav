@@ -77,7 +77,7 @@ except ImportError:
 DEFAULT_SHOT_SEQUENCE = [
     {
         "type": "hold_location",
-        "location": "back",
+        "location": "right",
         "radius": 18.0,
         "height": 4.0,
         "duration": 10.0,
@@ -145,7 +145,9 @@ class RelativePositionController(Node):
             self._init_mpc()
         # Gimbal yaw sweep around the predicted car while it is hidden.
         self.coast_scan = (CoastScan(half_fov_deg=cfg.coast_scan_half_fov_deg, sigma_k=cfg.coast_scan_sigma,
-                                     max_deg=cfg.coast_scan_max_deg, rate_deg=cfg.coast_scan_rate_deg)
+                                     max_deg=cfg.coast_scan_max_deg, rate_deg=cfg.coast_scan_rate_deg,
+                                     mode=str(cfg.coast_scan_mode).lower(), step_deg=cfg.coast_scan_step_deg,
+                                     dwell_sec=cfg.coast_scan_dwell_sec)
                            if cfg.coast_scan_enable else None)
         self._coast_scan_time = None
         self.gimbal_ctrl = GimbalController(
@@ -198,6 +200,7 @@ class RelativePositionController(Node):
             ctra_gate_nis=cfg.ctra_gate_nis,
             ctra_estimate_accel=bool(cfg.ctra_estimate_accel),
             ctra_speed_noise=cfg.ctra_speed_noise,
+            ctra_max_reverse_speed=cfg.ctra_max_reverse_speed,
             ctra_reacquire_sec=cfg.ctra_reacquire_sec,
             ukf_coast_timeout_sec=cfg.ukf_coast_timeout_sec,
             ukf_std_a=cfg.ukf_std_a,
@@ -350,7 +353,9 @@ class RelativePositionController(Node):
         lost = self.detection is None or now - self.detection.received_time > self.cfg.feedforward_timeout_sec
         if lost and self._coast_start_time is None:
             self._coast_start_time = now
-            self._coast_z = drone_z
+            # Hold the current height -- but never below the altitude floor
+            # (run 20260929_141000 held 1.9 m and then sank to the ground).
+            self._coast_z = max(drone_z, self.cfg.shot_ground_z + self.cfg.mpc_min_altitude)
             self.get_logger().warning(
                 f"Target lost — COASTING on its last velocity at z={drone_z:.1f} m, shot sequence paused."
             )
@@ -515,7 +520,13 @@ class RelativePositionController(Node):
 
         distance = math.sqrt(p_cam.x ** 2 + p_cam.y ** 2 + p_cam.z ** 2)
         flips_before = self.estimator.heading_flips
+        state_flips_before = self.estimator.ctra.state_flips
         reject_reason = self.estimator.update(T_world_target, distance, stamp_sec)
+        if self.estimator.ctra.state_flips != state_flips_before:
+            self.get_logger().warning(
+                "Target filter was pinned at the reverse-speed limit: a forward car with a flipped "
+                "heading -- turned the estimate round.", throttle_duration_sec=1.0,
+            )
         if self.estimator.heading_flips != flips_before:
             self.get_logger().warning(
                 f"Detector heading was nose-to-tail at {distance:.0f} m (against the direction "
@@ -706,13 +717,15 @@ class RelativePositionController(Node):
             mpc = DroneMPC(
                 horizon_sec=cfg.mpc_horizon_sec, n_steps=int(cfg.mpc_steps),
                 build_dir=os.path.expanduser(cfg.mpc_build_dir),
-                w_radial=cfg.mpc_w_position, w_tangential=cfg.mpc_w_position,
+                w_radial=cfg.mpc_w_radial, w_tangential=cfg.mpc_w_tangential,
                 w_height=cfg.mpc_w_height, w_yaw=cfg.mpc_w_yaw, yaw_band_deg=cfg.mpc_band_angle_deg,
                 r_du_xy=cfg.mpc_r_velocity_change, r_du_z=cfg.mpc_r_vertical_change,
                 r_du_yaw=cfg.mpc_r_yaw_rate_change, terminal_factor=cfg.mpc_terminal_factor,
                 v_max_xy=cfg.pid_max_speed_xy, v_max_z=cfg.pid_max_speed_z,
                 yaw_rate_max=cfg.mpc_yaw_rate_max, accel_max_xy=cfg.pid_max_accel_xy,
                 accel_max_z=cfg.pid_max_accel_z, yaw_accel_max=cfg.mpc_yaw_accel_max,
+                max_range=cfg.mpc_max_range,
+                min_altitude=cfg.shot_ground_z + cfg.mpc_min_altitude,
             )
             self.mpc_tracker = MpcTracker(
                 mpc,

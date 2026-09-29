@@ -9,6 +9,10 @@ Camera/gimbal: the car is detected only inside the camera view (+-23 x +-13 deg)
 Detections: 15 Hz, 10 % dropped, 70 ms latency, noise scaled with the actual
     range (white + drifting bias), heading noise, flips beyond 40 m, 2 %
     outliers. -> TargetEstimator (CTRA EKF).
+    DOPE's input scale (dope_detector.py): it only detects the car at ~90 px;
+    while tracking it picks the scale from the last distance, but after 1 s
+    without a detection it cycles its 9 scales one per frame, and a frame
+    only detects if its scale is within one step of the one the range needs.
 Occlusions (--occlusions): blackouts of 1.5 / 3 / 4.5 s every ~20 s (trees).
 Drone plant (fitted on the race logs of 2026-09-28): transport delay (xy 0.8,
     z 0.7, yaw 0.25 s), first-order lag (0.45 / 0.3 / 0.3 s), 5 m/s^2 limit.
@@ -29,6 +33,13 @@ Variants:
     mpc_scan   mpc_new + the gimbal yaw sweep around the prediction while coasting
     mpc_scan_fast  a wider (2.5 sigma) sweep with a 90 deg/s gimbal (what-if: the real
                gimbal's slew rate is unknown; the sim default is 40 deg/s)
+    mpc_now    the defaults as flown 2026-09-29 12:44 (CTRV, scenarios, 2.5 sigma scan)
+    mpc_maxr   + soft maximum range 45 m to the car (cut inside instead of losing it)
+    mpc_fade   + the horizon car keeps turning (turn rate fading over 1.5 s)
+    mpc_both   + both
+    no_scan / sweep / stare   current defaults with no gimbal scan, the continuous sweep,
+               and stop-and-stare (180 deg/s gimbal, as measured)
+Shots (--shot): back (18 m behind, the race-run shot), right, left (18 m beside).
 
     python3 scripts/mpc_closed_loop_sim.py                          # no occlusions
     python3 scripts/mpc_closed_loop_sim.py --occlusions             # trees
@@ -72,6 +83,24 @@ VARIANTS = {
                       scan=dict(sigma_k=1.5, rate_deg=40.0, max_deg=40.0)),
     "mpc_scan_fast": dict(controller="mpc", coast=CoastParams(3.0, 1.0, 40.0, 1.5), reacquire=5.0, timeout=5.0, window=1.0,
                           accel=False, scan=dict(sigma_k=2.5, rate_deg=90.0, max_deg=50.0), gimbal_rate_deg=90.0),
+    # current defaults (as flown on 2026-09-29 12:44) and the right-side-loss fixes
+    "mpc_now":  dict(controller="mpc", coast=CoastParams(3.0, 1.0, 40.0, 1.5), reacquire=5.0, timeout=5.0, window=1.0,
+                     accel=False, scan=dict(), gimbal_rate_deg=90.0, max_range=0.0, track_fade=0.0),
+    "mpc_maxr": dict(controller="mpc", coast=CoastParams(3.0, 1.0, 40.0, 1.5), reacquire=5.0, timeout=5.0, window=1.0,
+                     accel=False, scan=dict(), gimbal_rate_deg=90.0, max_range=45.0, track_fade=0.0),
+    "mpc_fade": dict(controller="mpc", coast=CoastParams(3.0, 1.0, 40.0, 1.5), reacquire=5.0, timeout=5.0, window=1.0,
+                     accel=False, scan=dict(), gimbal_rate_deg=90.0, max_range=0.0, track_fade=1.5),
+    "mpc_both": dict(controller="mpc", coast=CoastParams(3.0, 1.0, 40.0, 1.5), reacquire=5.0, timeout=5.0, window=1.0,
+                     accel=False, scan=dict(), gimbal_rate_deg=90.0, max_range=45.0, track_fade=1.5),
+    # scan comparison (current defaults otherwise; gimbal 180 deg/s as measured on 2026-09-29)
+    "no_scan":  dict(controller="mpc", coast=CoastParams(3.0, 1.0, 40.0, 1.5), reacquire=5.0, timeout=5.0, window=1.0,
+                     accel=False, gimbal_rate_deg=180.0, max_range=45.0, track_fade=1.5, w=(90.0, 10.0)),
+    "sweep":    dict(controller="mpc", coast=CoastParams(3.0, 1.0, 40.0, 1.5), reacquire=5.0, timeout=5.0, window=1.0,
+                     accel=False, scan=dict(mode="sweep"), gimbal_rate_deg=180.0, max_range=45.0, track_fade=1.5,
+                     w=(90.0, 10.0)),
+    "stare":    dict(controller="mpc", coast=CoastParams(3.0, 1.0, 40.0, 1.5), reacquire=5.0, timeout=5.0, window=1.0,
+                     accel=False, scan=dict(mode="stare"), gimbal_rate_deg=180.0, max_range=45.0, track_fade=1.5,
+                     w=(90.0, 10.0)),
 }
 
 
@@ -127,6 +156,20 @@ class Gimbal:
         return abs(wrap(az - self.az)) <= HALF_FOV[0] and abs(el - self.el) <= HALF_FOV[1]
 
 
+SCALE_PYRAMID = [0.16, 0.2, 0.24, 0.28, 0.34, 0.4, 0.48, 0.556, 0.7]
+FX_FULL = 640.0 / math.tan(0.4)          # 1280 px, 0.8 rad HFOV
+
+
+def dope_scale_ok(rng, frame_idx, since_last_det):
+    """DOPE's adaptive input scale: fine while tracking; lost (> 1 s), only
+    the frames whose scale suits the range can detect."""
+    if since_last_det <= 1.0:
+        return True
+    wanted = 90.0 * rng / (FX_FULL * 4.4)
+    i_want = min(range(len(SCALE_PYRAMID)), key=lambda i: abs(SCALE_PYRAMID[i] - wanted))
+    return abs(frame_idx % len(SCALE_PYRAMID) - i_want) <= 1
+
+
 def shot_point(car_p, car_psi):
     c, s = math.cos(car_psi), math.sin(car_psi)
     return np.array([car_p[0] + c * OFFSET[0] - s * OFFSET[1], car_p[1] + s * OFFSET[0] + c * OFFSET[1], OFFSET[2]])
@@ -143,9 +186,21 @@ def blackouts(t_start, t_end, seed):
     return out
 
 
-def run(variant, world, seconds, seed, mpc, occlusions):
+class ScaledSpline:
+    """The car's path driven `k` times faster (k > 1: faster than race_driver's
+    15 m/s profile, e.g. the 16 m/s seen in Gazebo on 2026-09-29)."""
+    def __init__(self, spline, k):
+        self.spline, self.k = spline, k
+
+    def __call__(self, t, nu=0):
+        return self.spline(np.asarray(t) * self.k, nu) * self.k ** nu
+
+
+def run(variant, world, seconds, seed, mpc, occlusions, speed_scale=1.0, trace=None):
     cfg = VARIANTS[variant]
     spline, t_end = race_truth(world)
+    if speed_scale != 1.0:
+        spline, t_end = ScaledSpline(spline, speed_scale), t_end / speed_scale
     t_end = min(t_end - 3.0, seconds + 3.0)
     rs = np.random.default_rng(seed)
     car_psi_at = lambda t: math.atan2(*spline(t, 1)[::-1])
@@ -166,11 +221,15 @@ def run(variant, world, seconds, seed, mpc, occlusions):
                                 max_integral_xy=3.0)
     tracker = None
     if cfg["controller"] == "mpc":
+        mpc.set_max_range(cfg.get("max_range", 0.0))
+        wr, wt = cfg.get("w", (30.0, 30.0))
+        mpc.set_weights(wr, wt, 5.0, 10.0, 10.0, 0.1, 1.0, 2.0, 2.0)
         tracker = MpcTracker(mpc, DELAYS, TAUS, scenario_window_sec=cfg["window"])
         tracker.reset()
     blk = blackouts(t, t_end, seed) if occlusions else []
     bias, hb = np.zeros(2), 0.0
     det = None
+    dope_frame, dope_last = 0, -1e9       # DOPE's own frame counter / last detection time
     next_det = next_ctrl = t
     cmd = np.zeros(4)
     m = {"err": [], "rad": [], "ang": [], "yaw": [], "rng": [], "du": [], "ms": [],
@@ -199,8 +258,10 @@ def run(variant, world, seconds, seed, mpc, occlusions):
             bias = a * bias + math.sqrt(1 - a * a) * 0.035 * rng * rs.standard_normal(2)
             hb = ah * hb + math.sqrt(1 - ah * ah) * math.radians(3.0) * rs.standard_normal()
             visible = (9.4 <= rng <= 80.0 and not occluded and gimbal.sees(plant.p, c_cap)
-                       and rs.random() >= 0.1)
+                       and rs.random() >= 0.1 and dope_scale_ok(rng, dope_frame, t - dope_last))
+            dope_frame += 1
             if visible:
+                dope_last = t
                 xy = c_cap + bias + 0.035 * rng * rs.standard_normal(2)
                 if rs.random() < 0.02:
                     ang = rs.uniform(-math.pi, math.pi)
@@ -248,7 +309,7 @@ def run(variant, world, seconds, seed, mpc, occlusions):
                                   float(rate[0]), coasting)
             else:
                 times = tracker.stage_times(t)
-                hx, hy, hpsi, hsig = predict_horizon(est, det, times, coasting, cp, 0.0)
+                hx, hy, hpsi, hsig = predict_horizon(est, det, times, coasting, cp, cfg.get("track_fade", 0.0))
                 n1 = len(times)
                 x_meas = np.r_[plant.p, plant.v, plant.psi, plant.r]
                 scen = None if coasting else range_scenarios(est, det, times, t)
@@ -271,8 +332,13 @@ def run(variant, world, seconds, seed, mpc, occlusions):
             sp = shot_point(car_p, car_psi)
             d = plant.p[:2] - car_p
             m["err"].append(float(np.hypot(*(plant.p[:2] - sp[:2]))))
-            m["rad"].append(abs(np.hypot(*d) - 18.0))
-            m["ang"].append(abs(math.degrees(wrap(math.atan2(d[1], d[0]) - (car_psi + math.pi)))))
+            rad_s = np.hypot(*d) - math.hypot(OFFSET[0], OFFSET[1])
+            ang_s = math.degrees(wrap(math.atan2(d[1], d[0]) - (car_psi + math.atan2(OFFSET[1], OFFSET[0]))))
+            m["rad"].append(abs(rad_s))
+            m["ang"].append(abs(ang_s))
+            if trace is not None:
+                trace.append((t, rad_s, ang_s, float(np.linalg.norm(np.r_[d, CAR_Z - plant.p[2]])),
+                              float(np.hypot(*spline(t, 1)))))
             m["yaw"].append(abs(math.degrees(wrap(math.atan2(-d[1], -d[0]) - plant.psi))))
             m["rng"].append(float(np.linalg.norm(np.r_[d, CAR_Z - plant.p[2]])))
     m["occl"] = [(round(blk[i][1] - blk[i][0], 1), st) for i, st in blk_state.items() if st is not None]
@@ -296,10 +362,31 @@ def pid_command(est, pid, plant, now, tgt, psi_pred, rate, coasting):
     return np.array([out.vx, out.vy, out.vz, out.yaw_rate])
 
 
+def catch_ups(ang, dt=DT_SIM, lost_deg=20.0, back_deg=10.0):
+    """Episodes where the angle round the car slipped past lost_deg: (recovered?,
+    seconds until it was back within back_deg)."""
+    eps, i, n = [], 0, len(ang)
+    while i < n:
+        if ang[i] > lost_deg:
+            j = i
+            while j < n and ang[j] > back_deg:
+                j += 1
+            eps.append((j < n, (j - i) * dt))
+            i = j + 1
+        else:
+            i += 1
+    return eps
+
+
 def summary(name, ms):
-    a = {k: np.array(v) for k, v in ms.items() if k not in ("occl", "lost", "lost_outside_occlusion")}
+    a = {k: np.array(v) for k, v in ms.items() if k not in ("occl", "lost", "lost_outside_occlusion", "eps")}
     band = np.mean((a["rad"] <= 5.0) & (a["ang"] <= 10.0)) * 100
+    eps = ms.get("eps", [])
+    rec = [d for ok, d in eps if ok]
     line = (f"{name:9} err {np.median(a['err']):5.2f} / {np.percentile(a['err'], 90):5.2f} m"
+            f" | distance held (+-5 m) {np.mean(a['rad'] <= 5.0) * 100:5.1f} %, worst off {a['rad'].max():5.1f} m"
+            f" | angle >20 deg: {len(eps)} times, back <10 deg {len(rec)}"
+            f" (median {np.median(rec) if rec else float('nan'):4.1f} s, max {max(rec) if rec else float('nan'):4.1f} s)"
             f" | band {band:4.1f} %"
             f" | yaw {np.median(a['yaw']):4.1f} / {np.percentile(a['yaw'], 90):4.1f} deg"
             f" | too close (<9.4 m) {np.mean(a['rng'] < 9.4) * 100:4.1f} %"
@@ -325,21 +412,69 @@ def main():
     ap.add_argument("--seconds", type=float, default=110.0)
     ap.add_argument("--seeds", type=int, default=2)
     ap.add_argument("--occlusions", action="store_true", help="add 1.5 / 3 / 4.5 s blackouts every ~20 s")
+    ap.add_argument("--shot", choices=["back", "right", "left"], default="back")
+    ap.add_argument("--weights", nargs="+", default=[],
+                    help="radial,tangential MPC weight pairs to compare (current defaults otherwise), e.g. 30,30 90,10")
+    ap.add_argument("--car-speed-scale", type=float, default=1.0,
+                    help="drive the car this much faster (1.07 ~ the 16 m/s seen in Gazebo)")
+    ap.add_argument("--plot", default="", help="save distance/angle-vs-time plots (first world, seed 0) to this PNG")
     args = ap.parse_args()
+    global OFFSET
+    OFFSET = {"back": np.array([-18.0, 0.0, 4.0]), "right": np.array([0.0, -18.0, 4.0]),
+              "left": np.array([0.0, 18.0, 4.0])}[args.shot]
+    for pair in args.weights:
+        wr, wt = (float(v) for v in pair.split(","))
+        VARIANTS[f"w{wr:g}/{wt:g}"] = dict(VARIANTS["mpc_both"], w=(wr, wt))
+    if args.weights:
+        args.variants = [f"w{float(p.split(',')[0]):g}/{float(p.split(',')[1]):g}" for p in args.weights]
     mpc = DroneMPC()
+    traces = {}
     print("error to the true shot point median / p90; band = +-5 m and +-10 deg around the car;"
           " yaw error to the car median / p90")
     for world in args.worlds:
-        print(f"== {world}, {args.seconds:.0f} s x {args.seeds} seeds, occlusions {'on' if args.occlusions else 'off'}")
+        print(f"== {world}, {args.seconds:.0f} s x {args.seeds} seeds, occlusions {'on' if args.occlusions else 'off'},"
+              f" shot {args.shot}")
         for name in args.variants:
-            agg = {"lost": 0, "lost_outside_occlusion": 0, "occl": []}
+            agg = {"lost": 0, "lost_outside_occlusion": 0, "occl": [], "eps": []}
             for seed in range(args.seeds):
-                for k, v in run(name, world, args.seconds, seed, mpc, args.occlusions).items():
+                tr = [] if (args.plot and seed == 0 and world == args.worlds[0]) else None
+                res = run(name, world, args.seconds, seed, mpc, args.occlusions, args.car_speed_scale, tr)
+                for k, v in res.items():
                     if k in ("lost", "lost_outside_occlusion"):
                         agg[k] += v
                     else:
                         agg.setdefault(k, []).extend(v)
+                agg["eps"].extend(catch_ups(np.array(res["ang"])))
+                if tr is not None:
+                    traces[name] = np.array(tr)
             summary(name, agg)
+    if args.plot and traces:
+        plot_traces(traces, args)
+
+
+def plot_traces(traces, args):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    r_ref = math.hypot(OFFSET[0], OFFSET[1])
+    fig, ax = plt.subplots(3, 1, figsize=(13, 10), sharex=True)
+    for name, tr in traces.items():
+        ax[0].plot(tr[:, 0], tr[:, 3], lw=1, label=name)
+        ax[1].plot(tr[:, 0], tr[:, 2], lw=1, label=name)
+    ax[0].axhspan(r_ref - 5, r_ref + 5, color="g", alpha=0.12, label=f"shot distance +-5 m")
+    ax[0].axhline(9.4, color="r", ls="--", lw=0.8, label="DOPE min (9.4 m)")
+    ax[0].axhline(80, color="r", ls=":", lw=0.8, label="detections rejected (80 m)")
+    ax[0].set_ylabel("range to car [m]"); ax[0].legend(fontsize=8, ncol=3); ax[0].grid(alpha=0.3)
+    ax[1].axhspan(-10, 10, color="g", alpha=0.12)
+    ax[1].set_ylabel("angle round the car vs shot [deg]"); ax[1].legend(fontsize=8); ax[1].grid(alpha=0.3)
+    first = next(iter(traces.values()))
+    ax[2].plot(first[:, 0], first[:, 4], "k", lw=1, label="car speed")
+    ax[2].axhline(15, color="r", ls="--", lw=0.8, label="drone speed limit")
+    ax[2].set_ylabel("car speed [m/s]"); ax[2].set_xlabel("time [s]"); ax[2].legend(fontsize=8); ax[2].grid(alpha=0.3)
+    fig.suptitle(f"{args.worlds[0]}, shot {args.shot}, car speed x{args.car_speed_scale:g}")
+    fig.tight_layout()
+    fig.savefig(args.plot, dpi=110)
+    print(f"plot saved: {args.plot}")
 
 
 if __name__ == "__main__":

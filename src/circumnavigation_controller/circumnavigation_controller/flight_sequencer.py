@@ -68,6 +68,10 @@ class FlightSequencer:
     def tick(self, now: float, have_drone_pose: bool):
         if not self.fcu_state.connected:
             return
+        if self.rtl_initiated:
+            # The flight is ending (RTL / LAND): never re-enable tracking
+            # (after a search-timeout LAND it came back "Tracking enabled").
+            return
 
         if not self._guided_confirmed:
             if not self._guided_requested:

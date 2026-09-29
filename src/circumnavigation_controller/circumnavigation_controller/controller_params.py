@@ -29,8 +29,15 @@ PARAMETERS = [
     ("mpc_horizon_sec", 2.0, "MPC prediction horizon (s). Changing it regenerates the solver."),
     ("mpc_steps", 20, "MPC steps over the horizon. Changing it regenerates the solver."),
     ("mpc_build_dir", "~/.ros/drone_mpc", "Where the generated acados solver is kept (reused across runs)."),
-    ("mpc_w_position", 30.0,
-     "Weight on the radial and tangential position error, each divided by its band half-width."),
+    ("mpc_w_radial", 90.0,
+     "Weight on the distance to the car vs the shot radius, divided by mpc_band_radial. Higher "
+     "than mpc_w_tangential = keep the distance (and the car in DOPE's range) first, let the angle "
+     "round the car catch up later. Offline, right shot, car below the drone's top speed: "
+     "90/10 held the distance 92 % of the time (30/30: 67 %), never too close (7 %), angle slips "
+     "back within 10 deg in a median 3.5 s; behind shot in band 36 vs 39 %."),
+    ("mpc_w_tangential", 10.0,
+     "Weight on the angle round the car (as the chord r x |unit(drone - car) - unit(shot - car)|), "
+     "divided by radius x mpc_band_angle_deg."),
     ("mpc_band_radial", 5.0, "Radial band half-width: distance to the car within the shot radius +- this (m)."),
     ("mpc_band_angle_deg", 10.0,
      "Angular band half-width around the car (deg); also the yaw error that costs w_yaw."),
@@ -60,9 +67,21 @@ PARAMETERS = [
     ("mpc_tau_xy_sec", 0.45, "First-order lag of the horizontal velocity after the delay (s)."),
     ("mpc_tau_z_sec", 0.3, "Lag of the vertical velocity (s)."),
     ("mpc_tau_yaw_sec", 0.3, "Lag of the yaw rate (s)."),
-    ("mpc_turn_fade_sec", 0.0,
-     "Car prediction over the horizon: 0 = straight line at the current speed and heading (best "
-     "worst case in the benchmark); > 0 = the turn rate fades with this time constant."),
+    ("mpc_turn_fade_sec", 1.5,
+     "Car over the MPC horizon keeps turning, its turn rate fading with this time constant (s); "
+     "0 = straight line. The car position alone was a bit more robust straight (filter "
+     "benchmark), but the shot point swings round the car in a turn and the MPC has to see it: "
+     "closed loop the 'behind' shot went 31 -> 40 % in band (Silverstone), 16 -> 27 % "
+     "(Oschersleben), yaw error halved; the 'right' shot 16 -> 13 m median error."),
+    ("mpc_min_altitude", 2.0,
+     "Soft altitude floor above shot_ground_z (m) for the MPC and for the height held while "
+     "coasting. Run 20260929_141000 had no floor: the MPC traded height for (3D) range and "
+     "flew into the ground."),
+    ("mpc_max_range", 45.0,
+     "Soft maximum HORIZONTAL range to the car (m; 0 = off). When the shot point runs away faster than the "
+     "drone can fly (18 m right of a car in a long left turn needs ~2x its speed) the MPC gives "
+     "up shot accuracy to keep the car detectable (DOPE to ~80 m) and cuts inside. Run "
+     "20260929_124410 lost the car at 80 m chasing a right-side shot round a left turn."),
 
     # ---- Drone position loop ----
     ("shot_ground_z", 0.0,
@@ -182,6 +201,10 @@ PARAMETERS = [
      "estimated acceleration carried the straight's +2 m/s^2 into braking zones, pushing the speed "
      "estimate up while the car braked (offline +1.6 m/s vs +0.7 m/s; 10 % worse p90 at 1-2 s)."),
     ("ctra_speed_noise", 2.0, "CTRV: speed random-walk std (m/s^2)."),
+    ("ctra_max_reverse_speed", 8.0,
+     "Fastest the car can reverse (m/s; the drive plugin's limit). The filter's speed is signed "
+     "down to -this; pinned there it must be a forward car with a flipped heading, and is turned "
+     "round."),
     ("ctra_heading_std_deg", 4.0, "CTRA: detector heading measurement std (deg); DOPE measured ~3.6."),
     ("ctra_reacquire_sec", 5.0,
      "CTRA: after a detection gap up to this long (s) the EKF predicts through it and gates the "
@@ -232,8 +255,16 @@ PARAMETERS = [
     ("coast_scan_half_fov_deg", 23.0, "Camera half field of view, horizontal (deg; 0.8 rad HFOV)."),
     ("coast_scan_max_deg", 50.0, "Largest sweep half-width (deg)."),
     ("coast_scan_rate_deg", 90.0,
-     "Sweep speed (deg/s). ASSUMES the gimbal can slew this fast -- not verified in Gazebo: "
-     "check the gimbal_yaw column during a coast; if it lags the sweep, lower this."),
+     "Gimbal slew between scan views (stare) / sweep speed (sweep), deg/s. Run 20260929_142724 "
+     "showed the gimbal moving 100-190 deg/s, so 90 is within reach."),
+    ("coast_scan_mode", "stare",
+     "stare: stop-and-stare -- hold the prediction, then +-step, +-2 step ... each for "
+     "coast_scan_dwell_sec. sweep: continuous back-and-forth. Lost, DOPE tries one of its 9 input "
+     "scales per frame, so a view must be held ~0.6 s for the right one to come round; the sweep "
+     "of run 20260929_142724 crossed the car at ~176 deg/s (3-4 frames) without a detection."),
+    ("coast_scan_step_deg", 30.0, "Stare: angle between scan views (deg; the camera sees 46 deg)."),
+    ("coast_scan_dwell_sec", 0.7,
+     "Stare: hold each view this long (s): >= DOPE's scale cycle, 9 frames at 15 Hz = 0.6 s."),
     ("gimbal_initial_pitch_deg", -5.0,
      "Gimbal pitch at boot; keep equal to MNT1_NEUTRAL_Y in config/gimbal_startup.parm (deg)."),
 

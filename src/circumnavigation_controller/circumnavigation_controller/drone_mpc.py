@@ -13,8 +13,9 @@ by the delay with the commands already sent (propagate_delay) and plans from
 there, so the first planned command is the one to send now.
 
 Cost per stage (nonlinear least squares, all references are parameters):
-    radial / tangential position error to the shot point, each divided by its
-        band half-width (5 m radial; r_ref * 10 deg around the car, >= 2 m),
+    distance to the car vs the shot radius, and the angle round the car (as a
+        chord, r_ref * |unit(drone - car) - unit(shot - car)|), each divided by
+        its band half-width (5 m; r_ref * 10 deg around the car, >= 2 m),
         so the cost contours are the "rainbow band" slice around the car,
         scaled by w_pos (drops as the car prediction gets uncertain);
     height error;
@@ -50,8 +51,8 @@ PX, PY, PZ, VX, VY, VZ, PSI, R, UX, UY, UZ, UR = range(NX)
  P_S_RAD, P_S_TAN, P_W_POS, P_W_YAW, P_R_MIN, P_TAU_XY, P_TAU_Z, P_TAU_R,
  P_BRK_X, P_BRK_Y, P_ACC_X, P_ACC_Y, P_R_MIN_SCEN) = range(21)
 NP = 21
-NY, NY_E = 9, 5
-FORMULATION_VERSION = 3      # bump when the OCP structure below changes
+NY, NY_E = 10, 6
+FORMULATION_VERSION = 5      # bump when the OCP structure below changes
 
 
 def _acados_env():
@@ -76,8 +77,8 @@ class DroneMPC:
         horizon_sec: float = 2.0,
         n_steps: int = 20,
         build_dir: str = os.path.expanduser("~/.ros/drone_mpc"),
-        w_radial: float = 30.0,
-        w_tangential: float = 30.0,
+        w_radial: float = 90.0,
+        w_tangential: float = 10.0,
         w_height: float = 5.0,
         w_yaw: float = 10.0,
         yaw_band_deg: float = 10.0,
@@ -93,6 +94,8 @@ class DroneMPC:
         yaw_accel_max: float = 3.0,
         range_slack_linear: float = 50.0,
         range_slack_quadratic: float = 50.0,
+        max_range: float = 45.0,
+        min_altitude: float = 2.0,
         force_rebuild: bool = False,
         verbose: bool = False,
     ):
@@ -130,6 +133,8 @@ class DroneMPC:
                          r_du_xy, r_du_z, r_du_yaw, terminal_factor)
         self.set_limits(v_max_xy, v_max_z, yaw_rate_max, accel_max_xy, accel_max_z, yaw_accel_max,
                         range_slack_linear, range_slack_quadratic)
+        self.set_max_range(max_range)
+        self.set_min_altitude(min_altitude)
         self._initialized = False
 
     # ------------------------------------------------------------------
@@ -152,10 +157,21 @@ class DroneMPC:
             du,
         )
 
-        # Position error in the shot's radial / tangential frame.
-        ex, ey = x[PX] - p[P_REF_X], x[PY] - p[P_REF_Y]
-        e_rad = p[P_DIR_X] * ex + p[P_DIR_Y] * ey
-        e_tan = -p[P_DIR_Y] * ex + p[P_DIR_X] * ey
+        # Position error split into DISTANCE to the car and ANGLE round it,
+        # exactly (not projected on the shot's radial direction, which only
+        # measures distance while the angle error is small: with a large
+        # angle error a high radial weight then did not hold the distance).
+        #   e_rad = |drone - car| - r_ref          (horizontal distance error)
+        #   e_tan = r_ref * (unit(drone - car) - dir_ref), a 2-vector: its
+        #           length is the chord 2 r_ref sin(dtheta / 2) -- ~ the arc
+        #           for small angles, growing all the way to 180 deg, fading
+        #           with r_ref for overhead shots.
+        dcx, dcy = x[PX] - p[P_CAR_X], x[PY] - p[P_CAR_Y]
+        dist_c = ca.sqrt(dcx * dcx + dcy * dcy + 1.0)
+        r_ref = ca.sqrt((p[P_REF_X] - p[P_CAR_X]) ** 2 + (p[P_REF_Y] - p[P_CAR_Y]) ** 2)
+        e_rad = dist_c - ca.sqrt(r_ref * r_ref + 1.0)
+        e_tan_x = r_ref * (dcx / dist_c - p[P_DIR_X])
+        e_tan_y = r_ref * (dcy / dist_c - p[P_DIR_Y])
         sw = ca.sqrt(p[P_W_POS])
         # Facing the car: sin / (1 - cos) of yaw - bearing, via the unit
         # vector to the car (no atan2, no wrap; +1 m^2 keeps it finite overhead).
@@ -166,7 +182,8 @@ class DroneMPC:
         swy = ca.sqrt(p[P_W_YAW])
         y_track = ca.vertcat(
             sw * e_rad / p[P_S_RAD],
-            sw * e_tan / p[P_S_TAN],
+            sw * e_tan_x / p[P_S_TAN],
+            sw * e_tan_y / p[P_S_TAN],
             sw * (x[PZ] - p[P_REF_Z]),
             swy * s_e,
             swy * (1.0 - c_e),
@@ -197,16 +214,25 @@ class DroneMPC:
         rng = range_to(p[P_CAR_X], p[P_CAR_Y]) - p[P_R_MIN]
         rng_brk = range_to(p[P_BRK_X], p[P_BRK_Y]) - p[P_R_MIN_SCEN]
         rng_acc = range_to(p[P_ACC_X], p[P_ACC_Y]) - p[P_R_MIN_SCEN]
-        m.con_h_expr = ca.vertcat(speed2, rng, rng_brk, rng_acc)
-        m.con_h_expr_e = rng
+        # Maximum range is HORIZONTAL: with the 3D range, flying lower was a
+        # way to "get closer" and the MPC dived toward the ground once the
+        # car ran away (run 20260929_141000: 4 m -> 0.5 m). The minimum
+        # range stays 3D (climbing over the car is legitimate).
+        rng_h = ca.sqrt((x[PX] - p[P_CAR_X]) ** 2 + (x[PY] - p[P_CAR_Y]) ** 2 + 1e-6)
+        # h rows: 0 command speed^2 (hard) | 1 range - r_min | 2, 3 scenario
+        # ranges | 4 horizontal range (<= r_max) | 5 altitude (>= floor);
+        # rows 1-5 soft. Bounds / penalties are set at runtime.
+        m.con_h_expr = ca.vertcat(speed2, rng, rng_brk, rng_acc, rng_h, x[PZ])
+        m.con_h_expr_e = ca.vertcat(rng, rng_h, x[PZ])
         c = ocp.constraints
-        c.lh = np.zeros(4); c.uh = np.array([15.0 ** 2, 1e6, 1e6, 1e6])
-        c.lh_e = np.array([0.0]); c.uh_e = np.array([1e6])
-        c.idxsh = np.array([1, 2, 3]); c.idxsh_e = np.array([0])
-        ocp.cost.zl = np.full(3, 50.0); ocp.cost.zu = np.zeros(3)
-        ocp.cost.Zl = np.full(3, 50.0); ocp.cost.Zu = np.zeros(3)
-        ocp.cost.zl_e = np.array([50.0]); ocp.cost.zu_e = np.array([0.0])
-        ocp.cost.Zl_e = np.array([50.0]); ocp.cost.Zu_e = np.array([0.0])
+        c.lh = np.array([0.0, 0.0, 0.0, 0.0, 0.0, -1e6])
+        c.uh = np.array([15.0 ** 2, 1e6, 1e6, 1e6, 1e6, 1e6])
+        c.lh_e = np.array([0.0, 0.0, -1e6]); c.uh_e = np.array([1e6, 1e6, 1e6])
+        c.idxsh = np.array([1, 2, 3, 4, 5]); c.idxsh_e = np.array([0, 1, 2])
+        ocp.cost.zl = np.zeros(5); ocp.cost.zu = np.zeros(5)
+        ocp.cost.Zl = np.zeros(5); ocp.cost.Zu = np.zeros(5)
+        ocp.cost.zl_e = np.zeros(3); ocp.cost.zu_e = np.zeros(3)
+        ocp.cost.Zl_e = np.zeros(3); ocp.cost.Zu_e = np.zeros(3)
         # Boxes on the applied command (states) and its rate (inputs).
         c.idxbx = np.array([UX, UY, UZ, UR])
         c.lbx = -np.array([15.0, 15.0, 3.0, 1.5]); c.ubx = -c.lbx
@@ -247,7 +273,7 @@ class DroneMPC:
         The yaw residual is sin(error), so it is divided by sin(yaw band): a
         yaw error equal to the band costs w_yaw."""
         yb = math.sin(math.radians(yaw_band_deg)) ** 2
-        track = [w_radial, w_tangential, w_height, w_yaw / yb, w_yaw / yb]
+        track = [w_radial, w_tangential, w_tangential, w_height, w_yaw / yb, w_yaw / yb]
         W = np.diag(track + [r_du_xy, r_du_xy, r_du_z, r_du_yaw])
         W_e = np.diag([terminal_factor * w for w in track])
         for k in range(self.N):
@@ -258,21 +284,60 @@ class DroneMPC:
                    range_slack_linear, range_slack_quadratic):
         ubx = np.array([v_max_xy, v_max_xy, v_max_z, yaw_rate_max])
         ubu = np.array([accel_max_xy, accel_max_xy, accel_max_z, yaw_accel_max])
-        for k in range(1, self.N):
+        for k in range(1, self.N + 1):
             self.solver.constraints_set(k, "lbx", -ubx)
             self.solver.constraints_set(k, "ubx", ubx)
-            self.solver.constraints_set(k, "uh", np.array([v_max_xy ** 2, 1e6, 1e6, 1e6]))
-        self.solver.constraints_set(self.N, "lbx", -ubx)
-        self.solver.constraints_set(self.N, "ubx", ubx)
         for k in range(self.N):
             self.solver.constraints_set(k, "lbu", -ubu)
             self.solver.constraints_set(k, "ubu", ubu)
-        for k in range(1, self.N):      # stage 0 is the fixed x0: no path constraint / slack there
-            self.solver.cost_set(k, "zl", np.full(3, range_slack_linear))
-            self.solver.cost_set(k, "Zl", np.full(3, range_slack_quadratic))
-        self.solver.cost_set(self.N, "zl", np.array([range_slack_linear]))
-        self.solver.cost_set(self.N, "Zl", np.array([range_slack_quadratic]))
         self._ubx = ubx
+        self._slack = (range_slack_linear, range_slack_quadratic)
+        self._r_max = 0.0
+        self._z_min = None
+        self._apply_h_bounds()
+
+    def set_max_range(self, r_max, r_min=10.0, slack_linear=None, slack_quadratic=None):
+        """Soft MAXIMUM horizontal range to the (predicted) car, r_max <= 0
+        switches it off. When the shot point runs away faster than the
+        drone can fly (e.g. 18 m to the right of a car in a long left turn:
+        the point needs ~2x the car's speed, the drone tops out at 15 m/s)
+        the cost alone just chases it round the outside while the car gets
+        away (run 20260929_124410 lost it at 80 m). Past r_max the MPC gives
+        up shot accuracy to keep the car within detection range: it cuts
+        inside. Horizontal, so altitude is never a way to comply."""
+        self._r_max = r_max
+        self._apply_h_bounds()
+
+    def set_min_altitude(self, z_min):
+        """Soft altitude floor (local z, m); None switches it off. The MPC
+        had no lower altitude limit at all."""
+        self._z_min = z_min
+        self._apply_h_bounds()
+
+    def _apply_h_bounds(self):
+        zl, Zl = self._slack
+        r_on = self._r_max > 0.0
+        z_on = self._z_min is not None
+        lh = np.array([0.0, 0.0, 0.0, 0.0, 0.0, self._z_min if z_on else -1e6])
+        uh = np.array([self._ubx[0] ** 2, 1e6, 1e6, 1e6, self._r_max if r_on else 1e6, 1e6])
+        #       slack rows:  range_min, brake, accel, range_max, altitude
+        zl_v = np.array([zl, zl, zl, 0.0, 4.0 * zl if z_on else 0.0])
+        Zl_v = np.array([Zl, Zl, Zl, 0.0, 4.0 * Zl if z_on else 0.0])
+        zu_v = np.array([0.0, 0.0, 0.0, zl if r_on else 0.0, 0.0])
+        Zu_v = np.array([0.0, 0.0, 0.0, Zl if r_on else 0.0, 0.0])
+        for k in range(1, self.N):      # stage 0 is the fixed x0: no path constraint / slack there
+            self.solver.constraints_set(k, "lh", lh)
+            self.solver.constraints_set(k, "uh", uh)
+            self.solver.cost_set(k, "zl", zl_v)
+            self.solver.cost_set(k, "Zl", Zl_v)
+            self.solver.cost_set(k, "zu", zu_v)
+            self.solver.cost_set(k, "Zu", Zu_v)
+        self.solver.constraints_set(self.N, "lh", np.array([0.0, 0.0, lh[5]]))
+        self.solver.constraints_set(self.N, "uh", np.array([1e6, uh[4], 1e6]))
+        self.solver.cost_set(self.N, "zl", np.array([zl, 0.0, zl_v[4]]))
+        self.solver.cost_set(self.N, "Zl", np.array([Zl, 0.0, Zl_v[4]]))
+        self.solver.cost_set(self.N, "zu", np.array([0.0, zu_v[3], 0.0]))
+        self.solver.cost_set(self.N, "Zu", np.array([0.0, Zu_v[3], 0.0]))
 
     # ------------------------------------------------------------------
     def solve(self, x0, params):
