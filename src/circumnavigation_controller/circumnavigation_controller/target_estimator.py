@@ -44,6 +44,7 @@ class Detection:
 
 
 class TargetEstimator:
+    STARTUP_VOTES = 5
     def __init__(
         self,
         *,
@@ -88,6 +89,7 @@ class TargetEstimator:
         ctra_heading_std: float = math.radians(4.0),
         ctra_estimate_accel: bool = False,
         ctra_speed_noise: float = 2.0,
+        ctra_max_reverse_speed: float = 8.0,
         ukf_coast_timeout_sec: float,
         ukf_std_a: float,
         ukf_std_yawdd: float,
@@ -137,6 +139,7 @@ class TargetEstimator:
             s_wdot=ctra_s_wdot, s_jerk=ctra_s_jerk, heading_std=ctra_heading_std,
             max_speed=kf_max_target_speed, max_turn_rate=max_yaw_rate,
             estimate_accel=ctra_estimate_accel, s_speed=ctra_speed_noise,
+            max_reverse_speed=ctra_max_reverse_speed,
         )
         self._ctra_last_update_time = None
         self.ukf = TargetCTRVUKF(
@@ -155,6 +158,9 @@ class TargetEstimator:
         self._yaw_rate_lpf = 0.0
         self._prev_heading_stamp = None
         self.heading_flips = 0          # DOPE headings turned round by the course check
+        self._startup_votes = None      # after a CTRA (re)start: did the next headings disagree?
+        self._ctra_start_time = None    # last (re)start / turn-round of the CTRA filter
+        self._reverse_pinned = 0        # consecutive updates at the reverse-speed limit
         self._course = None             # (direction of travel rad, stamp) at speed
 
         # ---- Estimate (world ENU) ----
@@ -316,13 +322,51 @@ class TargetEstimator:
             course_velocity = (float(t @ w[:, 1]) / denom, float(t @ w[:, 2]) / denom)
 
         raw_heading = wrap_to_pi(self.raw_heading(T_world_target))
-        raw_heading = self._resolve_heading_flip(raw_heading, stamp_sec, course_velocity)
+        raw_heading = self._resolve_flip_ctra(raw_heading, stamp_sec, gap, reseed, course_velocity)
         self._update_ctra(meas, r_std, raw_heading, fresh and not reseed, stamp_sec)
         self.z = float(meas[2]) if not fresh else self.z + self.z_alpha * (float(meas[2]) - self.z)
         self.vz = 0.0
         if not self.use_filtered_position:
             self.x, self.y = float(meas[0]), float(meas[1])
         return None
+
+    def _resolve_flip_ctra(self, raw_heading, stamp_sec, gap, reseed, course_velocity):
+        """Nose-to-tail flip check for the CTRA/CTRV filter, by CONTINUITY.
+
+        A DOPE flip is a sudden ~180 deg jump from one frame to the next; a
+        reversing car keeps its heading (only the speed goes through zero and
+        negative). So while the filter is running (last update <= 3 s ago)
+        a flip is a heading more than heading_flip_threshold from the
+        filter's own heading predicted to this frame. Checking against the
+        direction of travel instead (the old check) turned every correct
+        heading of a reversing car round (123 times in a 6 s reverse, the
+        shot then flipped to the other side of the car).
+        Only on a fresh start / after a longer gap, with no heading to be
+        continuous with, fall back to the direction of travel -- assuming the
+        car drives forward, as it almost always does."""
+        ekf = self.ctra
+        if ekf.initialized and not reseed and 0.0 <= gap <= self.heading_course_memory_sec:
+            predicted = ekf.heading + ekf.turn_rate * gap
+            disagrees = abs(angle_diff(raw_heading, predicted)) > self.heading_flip_threshold
+            # Right after a (re)start the filter's heading is a single
+            # detection's: if that one was the flip, the next ones all
+            # "disagree". DOPE flips are rare (~3 %), so a majority of the
+            # first STARTUP_VOTES disagreeing means the start was wrong:
+            # turn the filter round instead of the measurements.
+            if self._startup_votes is not None:
+                self._startup_votes.append(disagrees)
+                if len(self._startup_votes) >= self.STARTUP_VOTES:
+                    if sum(self._startup_votes) > self.STARTUP_VOTES // 2:
+                        ekf.turn_round()
+                        self._ctra_start_time = stamp_sec     # let it settle before the speed guard
+                        disagrees = False
+                    self._startup_votes = None
+            if disagrees:
+                self.heading_flips += 1
+                return wrap_to_pi(raw_heading + math.pi)
+            return raw_heading
+        self._startup_votes = []          # a (re)start follows: vote on its heading
+        return self._resolve_heading_flip(raw_heading, stamp_sec, course_velocity)
 
     def _update_ctra(self, meas, pos_std, raw_heading, fresh, stamp_sec):
         """Heading-aided CTRA EKF -> x, y, velocity, acceleration, heading,
@@ -336,7 +380,7 @@ class TargetEstimator:
                       and stamp_sec - self._ctra_last_update_time <= self.heading_course_memory_sec)
             speed = ekf.speed if (recent and ekf.initialized) else 0.0
             ekf.reset(float(meas[0]), float(meas[1]), raw_heading, speed,
-                      speed_std=3.0 if speed > 0.0 else None)
+                      speed_std=3.0 if speed != 0.0 else None)
             self._heading_reject_count = 0
         else:
             ekf.predict(stamp_sec - self._ctra_last_update_time)
@@ -351,6 +395,21 @@ class TargetEstimator:
                 self._heading_reject_count = 0
             else:
                 ekf.update(float(meas[0]), float(meas[1]), pos_std, psi)
+        # A filter pinned at the reverse-speed limit is a forward-driving car
+        # with its heading 180 deg wrong: turn it round. Only once it has
+        # settled (1 s after a (re)start or turn-round) and stays pinned for
+        # 3 updates: right after a start the speed estimate overshoots, and
+        # the guard undid a correct start-up vote. A new start-up vote
+        # follows (earlier votes were against the old heading).
+        if not fresh or self._ctra_start_time is None:
+            self._ctra_start_time = stamp_sec
+        pinned = ekf.speed <= -(ekf.max_reverse_speed - 0.5)
+        self._reverse_pinned = self._reverse_pinned + 1 if pinned else 0
+        if self._reverse_pinned >= 3 and stamp_sec - self._ctra_start_time > 1.0:
+            ekf.turn_round()
+            self._reverse_pinned = 0
+            self._ctra_start_time = stamp_sec
+            self._startup_votes = []
         self._ctra_last_update_time = stamp_sec
 
         if self.use_filtered_position:
@@ -359,7 +418,7 @@ class TargetEstimator:
         self.ax, self.ay = ekf.acceleration()
         self.heading = ekf.heading
         # Same low-speed fade as the EMA path: a car can't turn in place.
-        speed = ekf.speed
+        speed = abs(ekf.speed)
         if self.yaw_rate_min_speed > 0.0:
             fade = min(1.0, max(0.0, (speed - self.yaw_rate_min_speed) / self.yaw_rate_min_speed))
         else:

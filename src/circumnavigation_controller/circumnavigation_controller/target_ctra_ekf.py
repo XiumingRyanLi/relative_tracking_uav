@@ -3,7 +3,7 @@
 
 State (world ENU):  s = [x, y, psi, v, w, a]   (a pinned to 0 unless estimate_accel)
     x, y  position (m)          psi  heading (rad)
-    v     speed along psi (m/s) w    turn rate (rad/s)
+    v     speed along psi (m/s, < 0 reversing)  w  turn rate (rad/s)
     a     along-track accel (m/s^2)
 Motion: constant turn rate and acceleration (CTRA), white noise on the turn
     rate derivative (s_wdot) and on jerk (s_jerk).
@@ -45,6 +45,7 @@ class TargetCTRAEKF:
         max_step_sec: float = 0.02,
         estimate_accel: bool = False,
         s_speed: float = 2.0,
+        max_reverse_speed: float = 8.0,
     ):
         self.s_wdot = s_wdot
         self.s_jerk = s_jerk
@@ -64,6 +65,10 @@ class TargetCTRAEKF:
         # CTRV: +0.7 m/s, and 10 % better p90 1-2 s ahead.
         self.estimate_accel = estimate_accel
         self.s_speed = s_speed
+        # Signed speed: v < 0 is the car reversing (moving against its nose),
+        # down to -max_reverse_speed (the drive plugin allows -8 m/s).
+        self.max_reverse_speed = max_reverse_speed
+        self.state_flips = 0            # times the whole state was turned round (see check_reverse_limit)
         self.s = np.zeros(6)
         self.P = np.eye(6)
         self.initialized = False
@@ -72,7 +77,7 @@ class TargetCTRAEKF:
     def reset(self, x: float, y: float, psi: float, speed: float = 0.0, speed_std=None):
         """Start at a measured position/heading. `speed` can carry the last
         known speed across a short loss (the KF re-seed case)."""
-        self.s = np.array([x, y, _wrap(psi), max(0.0, speed), 0.0, 0.0])
+        self.s = np.array([x, y, _wrap(psi), min(max(speed, -self.max_reverse_speed), self.max_speed), 0.0, 0.0])
         vs = self.initial_speed_std if speed_std is None else speed_std
         self.P = np.diag([1.0, 1.0, self.heading_std ** 2, vs ** 2,
                           self.initial_turn_rate_std ** 2,
@@ -94,7 +99,7 @@ class TargetCTRAEKF:
 
     def _clamp(self):
         self.s[2] = _wrap(self.s[2])
-        self.s[3] = min(max(self.s[3], 0.0), self.max_speed)
+        self.s[3] = min(max(self.s[3], -self.max_reverse_speed), self.max_speed)
         self.s[4] = min(max(self.s[4], -self.max_turn_rate), self.max_turn_rate)
 
     def _propagate(self, dt: float, s=None, P=None):
@@ -109,7 +114,7 @@ class TargetCTRAEKF:
         F_total = np.eye(6)
         for _ in range(n):
             s, F = self._step(s, d)
-            s[3] = max(s[3], 0.0)
+            s[3] = min(max(s[3], -self.max_reverse_speed), self.max_speed)
             F_total = F @ F_total
         # Integrated white noise on w-dot (acting on psi, w) and jerk (on v, a).
         Q = np.zeros((6, 6))
@@ -161,6 +166,28 @@ class TargetCTRAEKF:
         I_KH = np.eye(6) - K @ H
         self.P = I_KH @ self.P @ I_KH.T + K @ R @ K.T   # Joseph form: stays symmetric PSD
         self._clamp()
+
+    def check_reverse_limit(self, margin: float = 0.5) -> bool:
+        """A car can't reverse faster than max_reverse_speed: a filter pinned
+        there is really a car driving forward with its heading 180 deg wrong
+        (a flip that got in). Turn the state round (heading + pi, speed
+        negated); True if it did."""
+        if self.initialized and self.s[3] <= -(self.max_reverse_speed - margin):
+            self.turn_round()
+            return True
+        return False
+
+    def turn_round(self):
+        """The same motion with the heading 180 deg the other way: heading + pi,
+        speed (and acceleration) negated."""
+        self.s[2] = _wrap(self.s[2] + math.pi)
+        self.s[3] = -self.s[3]
+        self.s[5] = -self.s[5]
+        T = np.eye(6)
+        T[3, 3] = -1.0
+        T[5, 5] = -1.0
+        self.P = T @ self.P @ T.T
+        self.state_flips += 1
 
     def predict_trajectory(self, times, turn_fade_tau=None):
         """Car at future times (seconds after the last update, ascending), no
