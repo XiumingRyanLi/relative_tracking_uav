@@ -13,8 +13,56 @@ PARAMETERS = [
     ("target_altitude", 3.0, "Takeoff altitude (m)."),
     ("hover_delay_sec", 4.0, "Hover time after takeoff before tracking starts (s)."),
     ("boundary_limit", 1000.0, "RTL when |x| or |y| of the drone exceeds this (m)."),
-    ("target_timeout_sec", 10.0,
-     "A target (and its camera-frame detection) counts as fresh for this long (s)."),
+    ("target_timeout_sec", 5.0,
+     "A target counts as fresh for this long after its last detection (s); after that SEARCH "
+     "starts. Just past the 4 s coast prediction: at 10 s (run 20260929_094556) the search "
+     "began 130 m from a car that had driven on."),
+
+    # ---- Controller choice ----
+    ("controller", "mpc",
+     "mpc: acados MPC (drone_mpc.py / mpc_tracker.py) flies tracking and coasting; the PID keeps "
+     "search/hold and takes over if the MPC is unavailable or a solve fails. pid: the PID only. "
+     "Offline closed loop (scripts/mpc_closed_loop_sim.py, Silverstone): error to the shot point "
+     "5.2 / 7.4 m median / p90 vs 25.5 / 41.1 m, in the +-5 m / +-10 deg band 39 % vs 2 %."),
+
+    # ---- MPC (controller=mpc) ----
+    ("mpc_horizon_sec", 2.0, "MPC prediction horizon (s). Changing it regenerates the solver."),
+    ("mpc_steps", 20, "MPC steps over the horizon. Changing it regenerates the solver."),
+    ("mpc_build_dir", "~/.ros/drone_mpc", "Where the generated acados solver is kept (reused across runs)."),
+    ("mpc_w_position", 30.0,
+     "Weight on the radial and tangential position error, each divided by its band half-width."),
+    ("mpc_band_radial", 5.0, "Radial band half-width: distance to the car within the shot radius +- this (m)."),
+    ("mpc_band_angle_deg", 10.0,
+     "Angular band half-width around the car (deg); also the yaw error that costs w_yaw."),
+    ("mpc_band_tangential_floor", 2.0,
+     "Tangential band never narrower than this (m), so the angle term fades out for overhead shots."),
+    ("mpc_w_height", 5.0, "Weight on the height error (per m)."),
+    ("mpc_w_yaw", 10.0, "Weight on facing the car (a yaw error of mpc_band_angle_deg costs this)."),
+    ("mpc_r_velocity_change", 0.1, "Weight on horizontal command changes (smooth commands)."),
+    ("mpc_r_vertical_change", 1.0, "Weight on vertical command changes."),
+    ("mpc_r_yaw_rate_change", 2.0, "Weight on yaw-rate command changes."),
+    ("mpc_terminal_factor", 2.0, "Terminal-stage multiplier on the tracking weights."),
+    ("mpc_sigma0", 5.0,
+     "Position weight at stage k = 1 / (1 + (sigma_k / sigma0)^2), sigma_k the predicted car "
+     "position std: far, uncertain stages only loosely steer the plan (m)."),
+    ("mpc_min_range", 10.0, "Soft minimum 3D range to the car (m): DOPE needs the whole car in view."),
+    ("mpc_scenario_window_sec", 1.0,
+     "Over this much of the plan (s, after the delay) the >= mpc_min_range constraint also holds "
+     "against a car that brakes hard / accelerates from now: the filter sees braking ~1 s late. "
+     "< 0 switches the scenarios off."),
+    ("mpc_car_brake_decel", 4.0, "Braking scenario deceleration (m/s^2); race_driver brakes at 4."),
+    ("mpc_car_accel", 2.0, "Accelerating scenario (m/s^2, up to kf_max_target_speed); race_driver: 2."),
+    ("mpc_yaw_rate_max", 1.5, "Yaw-rate command limit (rad/s)."),
+    ("mpc_yaw_accel_max", 3.0, "Yaw-rate command change limit (rad/s^2)."),
+    ("mpc_delay_xy_sec", 0.8, "Command -> response transport delay, horizontal (fitted on the race logs)."),
+    ("mpc_delay_z_sec", 0.7, "Transport delay, vertical (s)."),
+    ("mpc_delay_yaw_sec", 0.25, "Transport delay, yaw rate (s)."),
+    ("mpc_tau_xy_sec", 0.45, "First-order lag of the horizontal velocity after the delay (s)."),
+    ("mpc_tau_z_sec", 0.3, "Lag of the vertical velocity (s)."),
+    ("mpc_tau_yaw_sec", 0.3, "Lag of the yaw rate (s)."),
+    ("mpc_turn_fade_sec", 0.0,
+     "Car prediction over the horizon: 0 = straight line at the current speed and heading (best "
+     "worst case in the benchmark); > 0 = the turn rate fades with this time constant."),
 
     # ---- Drone position loop ----
     ("shot_ground_z", 0.0,
@@ -100,14 +148,18 @@ PARAMETERS = [
     # Past feedforward_timeout_sec without a detection the drone is COASTING:
     # the target is predicted on from its last position at its last velocity,
     # the shot heading is frozen, the height held and the shot sequence paused.
-    # After target_timeout_sec it hovers.
-    ("coast_full_speed_sec", 2.0,
-     "Predict the lost target on at its last velocity for this long after the last detection (s). "
-     "Longer helps on straights, but a constant-velocity guess runs off the track in corners."),
+    # After target_timeout_sec it searches (or hovers, enable_search_mode false).
+    ("coast_full_speed_sec", 3.0,
+     "Predict the lost target on at full speed for this long after the last detection (s): long "
+     "enough to pick the car up again after a tree or a building hid it."),
     ("coast_taper_sec", 1.0,
      "Then slow the prediction to a stop over this long (s); it stays there until target_timeout_sec."),
-    ("coast_max_distance", 20.0,
+    ("coast_max_distance", 40.0,
      "Cap on how far the prediction moves the target from its last estimate (m)."),
+    ("coast_turn_fade_sec", 1.5,
+     "CTRA filter: while coasting the predicted car keeps turning, its turn rate fading with this "
+     "time constant (s); 0 = straight line. (The old coast froze the heading: in run "
+     "20260929_094556 it stayed at 84 deg while the car went round a hairpin.)"),
     ("max_visual_heading_jump_deg", 60.0, "Heading jumps larger than this are gated (deg)."),
     ("heading_course_min_speed", 3.0,
      "Above this target speed (m/s) the detector heading is checked against the direction of travel."),
@@ -124,8 +176,16 @@ PARAMETERS = [
      "Offline (scripts/benchmark_target_filter.py, held-out tracks) ctra was 13 % better now, "
      "29-31 % at 1-2 s ahead, 40 % on velocity and 31 % on heading."),
     ("ctra_turn_rate_noise", 0.2, "CTRA: white-noise turn-rate derivative std (rad/s^2)."),
-    ("ctra_jerk_noise", 0.5, "CTRA: white-noise jerk std (m/s^3)."),
+    ("ctra_jerk_noise", 0.5, "CTRA: white-noise jerk std (m/s^3); only with ctra_estimate_accel."),
+    ("ctra_estimate_accel", False,
+     "Estimate along-track acceleration (CTRA). Off (CTRV): DOPE shows braking ~1 s late, and an "
+     "estimated acceleration carried the straight's +2 m/s^2 into braking zones, pushing the speed "
+     "estimate up while the car braked (offline +1.6 m/s vs +0.7 m/s; 10 % worse p90 at 1-2 s)."),
+    ("ctra_speed_noise", 2.0, "CTRV: speed random-walk std (m/s^2)."),
     ("ctra_heading_std_deg", 4.0, "CTRA: detector heading measurement std (deg); DOPE measured ~3.6."),
+    ("ctra_reacquire_sec", 5.0,
+     "CTRA: after a detection gap up to this long (s) the EKF predicts through it and gates the "
+     "new detection against the prediction (wider after longer gaps) instead of restarting."),
     ("ctra_gate_nis", 25.0,
      "CTRA: reject a detection whose position NIS against the EKF prediction exceeds this "
      "(chi-square, 2 DOF). Above the textbook 13.8 because DOPE's drifting bias makes the EKF "
@@ -162,6 +222,18 @@ PARAMETERS = [
     ("gimbal_detection_timeout_sec", 0.5,
      "A detection older than this no longer steers the gimbal; it then points at the target "
      "estimate instead of re-applying the old image error (which made it drift to its limit)."),
+    ("coast_scan_enable", True,
+     "While the car is hidden (coasting), sweep the gimbal yaw around its prediction once the "
+     "prediction is too uncertain for the camera's view."),
+    ("coast_scan_sigma", 2.5,
+     "Sweep to cover this many position std of the prediction. Offline (closed loop, FOV + "
+     "gimbal modelled) the car came back up to 30-72 deg off the aim after 3-4.5 s blackouts; "
+     "1.5 sigma at 40 deg/s did not help, 2.5 sigma at 90 deg/s cut losses 7 -> 2 (Oschersleben)."),
+    ("coast_scan_half_fov_deg", 23.0, "Camera half field of view, horizontal (deg; 0.8 rad HFOV)."),
+    ("coast_scan_max_deg", 50.0, "Largest sweep half-width (deg)."),
+    ("coast_scan_rate_deg", 90.0,
+     "Sweep speed (deg/s). ASSUMES the gimbal can slew this fast -- not verified in Gazebo: "
+     "check the gimbal_yaw column during a coast; if it lags the sweep, lower this."),
     ("gimbal_initial_pitch_deg", -5.0,
      "Gimbal pitch at boot; keep equal to MNT1_NEUTRAL_Y in config/gimbal_startup.parm (deg)."),
 
@@ -172,6 +244,11 @@ PARAMETERS = [
     ("search_altitude", 20.0,
      "Search height above shot_ground_z (m): a wider view of the ground, and DOPE still "
      "detects the car out to ~45 m."),
+    ("search_timeout_sec", 10.0,
+     "Give up after searching this long (s) and end the flight with search_timeout_action; "
+     "0 = search until stopped."),
+    ("search_timeout_action", "LAND",
+     "ArduPilot mode when the search times out: LAND (land where it is) or RTL (fly home, land)."),
     ("search_gimbal_pitch_center_deg", -35.0,
      "Search sweep pitch centre (deg) when there has been no target yet; afterwards the sweep "
      "is centred on the last target estimate."),

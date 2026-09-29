@@ -80,11 +80,14 @@ class TargetEstimator:
         enable_heading_ukf: bool,
         use_ctra: bool = False,
         ctra_gate_nis: float = 25.0,
+        ctra_reacquire_sec: float = 5.0,
         course_window_sec: float = 1.0,
         z_alpha: float = 0.3,
         ctra_s_wdot: float = 0.2,
         ctra_s_jerk: float = 0.5,
         ctra_heading_std: float = math.radians(4.0),
+        ctra_estimate_accel: bool = False,
+        ctra_speed_noise: float = 2.0,
         ukf_coast_timeout_sec: float,
         ukf_std_a: float,
         ukf_std_yawdd: float,
@@ -126,12 +129,14 @@ class TargetEstimator:
         )
         self.use_ctra = use_ctra
         self.ctra_gate_nis = ctra_gate_nis
+        self.ctra_reacquire_sec = ctra_reacquire_sec
         self.course_window_sec = course_window_sec
         self.z_alpha = z_alpha
         self._course_window = deque()   # (stamp, x, y) of accepted raw positions
         self.ctra = TargetCTRAEKF(
             s_wdot=ctra_s_wdot, s_jerk=ctra_s_jerk, heading_std=ctra_heading_std,
             max_speed=kf_max_target_speed, max_turn_rate=max_yaw_rate,
+            estimate_accel=ctra_estimate_accel, s_speed=ctra_speed_noise,
         )
         self._ctra_last_update_time = None
         self.ukf = TargetCTRVUKF(
@@ -268,6 +273,7 @@ class TargetEstimator:
            position and its uncertainty (NIS > ctra_gate_nis is rejected).
            It widens by itself after gaps and in corners, where a fixed
            distance from a straight-line prediction rejected good frames;
+        Gaps up to ctra_reacquire_sec are predicted through (not restarted).
         2. direction of travel for the flip check from a straight-line fit
            through the last course_window_sec of accepted raw positions --
            independent of the heading, so a flipped heading can't confirm
@@ -280,7 +286,12 @@ class TargetEstimator:
         ekf = self.ctra
         r_std = self.kf.r_std + self.noise_per_m * distance
         last = self._ctra_last_update_time
-        fresh = ekf.initialized and last is not None and 0.0 <= stamp_sec - last <= self.kf_coast_timeout_sec
+        gap = stamp_sec - last if last is not None else math.inf
+        # Short gaps (the car behind a tree): predict through them and gate
+        # the new detection against the prediction -- its uncertainty has
+        # grown with the gap, so the gate is wider by itself -- rather than
+        # restarting the filter and re-learning speed and heading.
+        fresh = ekf.initialized and 0.0 <= gap <= self.ctra_reacquire_sec
         if fresh and self._reject_count < self.max_consecutive_rejects:
             nis = ekf.position_nis(float(meas[0]), float(meas[1]), r_std, stamp_sec - last)
             if nis > self.ctra_gate_nis:
@@ -292,7 +303,7 @@ class TargetEstimator:
         self._reject_count = 0
 
         window = self._course_window
-        if not fresh or reseed:
+        if not fresh or reseed or gap > self.kf_coast_timeout_sec:
             window.clear()
         window.append((stamp_sec, float(meas[0]), float(meas[1])))
         while stamp_sec - window[0][0] > self.course_window_sec:

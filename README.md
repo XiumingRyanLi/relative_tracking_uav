@@ -55,6 +55,28 @@ Follow these steps to install MAVROS. Ensure you install `ros-humble-mavros`:
 
 https://github.com/mavlink/mavros/blob/ros2/mavros/README.md#installation
 
+### acados (one-time, for the MPC)
+
+The default drone controller is an MPC solved with [acados](https://github.com/acados/acados); the
+model and cost are written in CasADi (installed with ROS here). Build acados once into `~/acados`
+(about 10 minutes; nothing is installed into the system Python -- `drone_mpc.py` puts the Python
+interface on its path and preloads the libraries):
+
+```bash
+git clone --recursive --depth 1 https://github.com/acados/acados.git ~/acados
+cd ~/acados && mkdir -p build && cd build
+cmake -DACADOS_WITH_QPOASES=ON -DCMAKE_POLICY_VERSION_MINIMUM=3.5 .. && make install -j16
+# template renderer (acados would otherwise ask interactively on first use)
+mkdir -p ~/acados/bin && curl -sSL -o ~/acados/bin/t_renderer \
+  https://github.com/acados/tera_renderer/releases/download/v0.2.1/t_renderer-v0.2.1-linux-amd64
+chmod +x ~/acados/bin/t_renderer
+```
+
+The solver itself is generated and compiled into `~/.ros/drone_mpc/<hash>/` the first time the
+controller starts (about a minute) and reused after that; only changing `mpc_horizon_sec`,
+`mpc_steps` or the formulation regenerates it. Without acados the controller logs an error and flies
+the PID (`controller:=pid` selects it explicitly).
+
 ### Simulation assets (one-time)
 
 `sim_launch.py` runs the world from `~/ardupilot_gazebo/worlds/iris_runway_new.sdf`, which includes
@@ -215,6 +237,14 @@ ros2 run circumnavigation_controller race_driver --ros-args -p world:=iris_osche
 - Pure pursuit steers from the car's direction of travel (yaw plus slip from the odometry's lateral
   velocity), not its nose: the car fishtails at ~1 Hz after any steering input, and chasing the nose
   kept that going as a constant weave on the straights (yaw rate ±12 deg/s, now ~2 deg/s).
+- Tree worlds `iris_monza_trees`, `iris_silverstone_trees`, `iris_oschersleben_trees`: the same
+  tracks with trees and bushes (`models/veg_*`, from gazebo-vegetation) in a few dense forest sections
+  plus scattered singles, close to the lane so they block the drone's view of the car at low
+  altitude. They are visual only (no collision: the drone flies through them rather than crashing)
+  and the start area is kept clear. `tools/build_tree_worlds.py` makes them (`--seed N` for another
+  layout, `--density 1.5` for more trees, `--plot` for a map) and installs them in
+  `~/ardupilot_gazebo/worlds`; link the models there once:
+  `for m in models/veg_*; do ln -s $PWD/$m ~/ardupilot_gazebo/models/; done`.
 - Racing lines live in `config/race_lines/<world>.csv`, made by `tools/build_race_lines.py` from each
   world's track mesh and pose (run it with `/usr/bin/python3`; `--plot` saves a picture). Re-run it
   and rebuild after moving or rescaling a track in its world file.
@@ -238,15 +268,46 @@ ros2 service call /mavros/gimbal_control/manager/pitchyaw mavros_msgs/srv/Gimbal
 ```
 camera image -> detector -> car pose in the camera frame
   -> camera -> gimbal -> drone -> world transform
-  -> target estimator: gating, constant-velocity KF (position, velocity),
-     heading EMA + yaw rate
-  -> shot point = car position + shot offset rotated by the (predicted) car heading,
+  -> target estimator: CTRA EKF (position, heading, speed, turn rate, accel) with a chi-square
+     gate and nose-to-tail flip correction (target_filter:=cv: the older KF + heading EMA)
+  -> shot point = car position + shot offset rotated by the car heading,
      kept >= 10 m from the car by the cinematic planner
-  -> PID with feedforward = car velocity + yaw rate x shot offset (only while detections are fresh)
-  -> /mavros/setpoint_velocity/cmd_vel  (body yaw faces the car, held when within 5 m of it)
+  -> MPC (default): car predicted over the next 2 s, shot point previewed along it, drone
+     velocity + yaw-rate command optimised through its measured delay and lag (see below)
+     PID (controller:=pid, search/hold, MPC fallback): feedforward = car velocity + yaw rate x offset
+  -> /mavros/setpoint_velocity/cmd_vel  (body yaw faces the car)
 gimbal: image-space controller keeps the car centred (5 Hz pitch/yaw commands, one correction per
         detection); after 0.5 s without a detection it points at the car's estimated position
 ```
+
+### MPC (`controller:=mpc`, default)
+
+`drone_mpc.py` (acados OCP, model/cost in CasADi) and `mpc_tracker.py` (glue), 20 Hz:
+
+```
+now ──► predict the drone 0.8 s ahead with the commands already sent (its transport delay)
+    ──► stage times t_k = now + 0.8 s + k * 0.1 s, k = 0..20  (2 s horizon)
+    ──► car at t_k: CTRA EKF rolled forward (straight line; coasting: the coast prediction)
+    ──► shot offset at t_k: cinematic planner preview (sees a move coming)
+    ──► per stage: shot point, radial direction, band scales, uncertainty and yaw weights
+    ──► acados SQP-RTI solve (~1.3 ms) ──► first command -> MAVROS
+```
+
+- Model: velocity follows the command with a first-order lag after a transport delay (fitted on the
+  race logs: horizontal 0.8 s + 0.45 s, vertical 0.7 s + 0.3 s, yaw rate 0.25 s + 0.3 s).
+- Cost: the position error split into radial (toward/away from the car) and tangential (around it)
+  parts, each divided by its band half-width -- 5 m, and radius x 10 deg (>= 2 m, so it fades for
+  overhead shots) -- the "rainbow band" slice; height; facing the car (sin / 1-cos of the yaw error);
+  command changes (smooth commands). Later stages weigh less as the car prediction gets uncertain.
+- Constraints: speed / yaw-rate / acceleration limits (hard); >= 10 m range to the car (soft, DOPE),
+  over the first 1 s of the plan also against a car that brakes hard while turning / accelerates
+  (`mpc_scenario_window_sec`): DOPE only shows braking ~1 s late.
+- Offline closed loop (`scripts/mpc_closed_loop_sim.py`: race-line car, DOPE-like detections, CTRA
+  EKF, the fitted drone response) on Silverstone: error to the shot point 5.2 / 7.4 m median / p90
+  vs 25.5 / 41.1 m for the PID, 39 % vs 2 % of the time inside the +-5 m / +-10 deg band, yaw error
+  4.8 vs 13 deg; still fine with the real delay 0.2 s off the assumed one. The rigid 18 m "behind"
+  shot needs up to 9-18 m/s^2 in corners against the drone's 5 m/s^2, so no controller stays inside
+  the band all the time.
 
 ### Cinematic shots
 
@@ -264,6 +325,8 @@ an overpass climbs instead, so its path stays continuous and it can fly straight
 | `controller_params.py` | config | every ROS parameter with its default and description (`ros2 param describe`) |
 | `target_estimator.py` | control | detection gating, position/velocity KF, heading filter and yaw rate |
 | `camera_frames.py` | control | camera -> gimbal -> drone -> world transforms, pose history |
+| `drone_mpc.py`, `mpc_tracker.py` | control | acados MPC (CasADi model/cost), delay compensation, per-stage references |
+| `target_ctra_ekf.py` | filters | heading-aided CTRA EKF, horizon prediction for the MPC |
 | `pid_controller.py` | control | velocity PID (filtered D, speed and acceleration limits) |
 | `gimbal_controller.py` | control | gimbal image-space controller |
 | `cinematic_planner.py` | control | shot offset sequence (hold, move, orbit, overpass, push/pull), 10 m minimum distance to the car |
@@ -288,17 +351,17 @@ an overpass climbs instead, so its path stays continuous and it can fly straight
 | `yaw_rate_tau_sec` / `yaw_rate_min_speed` | 1.0 s / 1.0 m/s | yaw rate = smoothed heading derivative, 0 below 1 m/s, full from 2 m/s (0.5 let heading noise on a parked car through) |
 | `max_rotation_feedforward` | 5 m/s | cap on yaw rate x shot offset; noise had pushed the drone sideways at 5+ m/s |
 | `feedforward_timeout_sec` | 0.5 s | a detection older than this starts COAST: shot heading frozen (no rotation feedforward or heading prediction), drone holds its current height, shot sequence paused until re-acquisition |
-| `coast_full_speed_sec` / `coast_taper_sec` / `coast_max_distance` | 2 s / 1 s / 20 m | while coasting, the target (drone setpoint and gimbal aim) is carried on at its last velocity for 2 s, slowed to a stop over 1 s and never moved more than 20 m; after `target_timeout_sec` (10 s) it searches. The CSV `stage` column reads `coast` |
+| `coast_full_speed_sec` / `coast_taper_sec` / `coast_max_distance` / `coast_turn_fade_sec` / `ctra_reacquire_sec` | 3 s / 1 s / 40 m / 1.5 s / 5 s | while coasting (a tree hides the car) the target -- drone setpoint, gimbal aim and the MPC horizon -- follows the EKF's own prediction (`target_prediction.py`): speed kept, turn rate fading over 1.5 s, heading moving with it, for 3 s, then slowed to a stop over 1 s, never more than 40 m. A detection after a gap of up to 5 s is gated against that prediction instead of restarting the filter. While hidden, the gimbal also sweeps its yaw around the prediction once it is too uncertain for the camera's view (`coast_scan_*`: 2.5 sigma, up to +-50 deg, 90 deg/s -- the gimbal slew rate is an assumption to check in Gazebo; offline it cut losses 7 -> 2 on Oschersleben). After `target_timeout_sec` (5 s) it searches. Offline with 1.5 / 3 / 4.5 s blackouts (`scripts/mpc_closed_loop_sim.py --occlusions`, Silverstone): lost 3 times vs 14 with the coast flown on 2026-09-29, car picked up after 3 s blackouts 10/12 vs 5/12. The CSV `stage` column reads `coast` |
 | `shot_transition_speed` / `shot_transition_min_sec` | 5 m/s / 2 s | a new GUI sequence first flies around the car (bearing, radius and height blended, the short way) from the current shot point to the sequence's start point; jumping there had the drone cut past the car at 8 m and lose it (run 20260928_120132) |
 | `move_location` (shot) | — | arcs round the car at a constant radius and height, on the side that passes `via` (any location; the short way if `via` is one of the ends). It used to be a straight line except for back<->front, which cut the corner to 0.7 x radius |
-| `enable_search_mode` / `search_altitude` | true / 20 m | SEARCH after `target_timeout_sec`: climb to 20 m where the drone is, face the last estimate and sweep the gimbal around it (±75 deg yaw, ±15 deg pitch). False hovers in place instead. CSV `stage` = `search` (or `hold`) |
+| `enable_search_mode` / `search_altitude` / `search_timeout_sec` / `search_timeout_action` | true / 20 m / 10 s / LAND | SEARCH after `target_timeout_sec`: climb to 20 m where the drone is, face the last estimate and sweep the gimbal around it (±75 deg yaw, ±15 deg pitch); after 10 s without the car the flight ends in LAND (or RTL). False hovers in place instead. CSV `stage` = `search` (or `hold`) |
 | `gimbal_kp_yaw`, `gimbal_kd_yaw`, `gimbal_yaw_deadband_deg`, `gimbal_max_yaw_step_deg` | 0.4, 0, 0.5, 8 | less yaw jitter without big overshoot when the body turns fast |
 | `gimbal_max_pitch_down_deg` / `gimbal_max_yaw_deg` | -135 / ±160 deg | the mount's real range (was -80 / ±90 in code, so the camera could never look straight down); below -90 it looks backwards, so an overhead pass needs no 180 deg yaw flip |
 | `yaw_hold_radius` | 5 m | the drone holds its body yaw when nearly above the car, where the bearing flips 180 deg |
 | `gimbal_detection_timeout_sec` | 0.5 s | each detection steers the gimbal once; after 0.5 s without one the gimbal points at the car's estimated position instead (re-applying the old error drove it to its pitch limit, e.g. into the sky) |
 | `heading_flip_threshold_deg` / `heading_course_min_speed` / `heading_course_memory_sec` | 110 deg / 3 m/s / 3 s | DOPE sometimes reads the car nose-to-tail at long range; a heading more than 110 deg from the direction of travel is turned round 180 deg (flips were >= 127 deg off, correct readings <= 86 deg, 4 race runs). The direction of travel is remembered for 3 s so a KF re-seed can't let a flip in (run 20260928_145616 lost the car that way) |
 | (latency) | — | the target estimate is carried on from the frame's capture stamp, not its arrival: it trailed the car by 0.7-0.8 m at 11 m/s. Falls back to arrival time if the stamp is in another clock domain |
-| `target_filter` | ctra | heading-aided CTRA EKF (`target_ctra_ekf.py`: x, y, heading, speed, turn rate, along-track accel; measures DOPE position + flip-resolved heading) for the target position, velocity, acceleration, heading and yaw rate. The CV KF is not used: detections are gated by a chi-square test on the EKF's own prediction (`ctra_gate_nis` 25; the textbook 13.8 rejected 10 % of good frames because DOPE's drifting bias makes the EKF overconfident), the flip check's direction of travel comes from a line fit through the last 1 s of raw positions (independent of the heading), and z is an EMA of the measured z. `cv` = the previous KF + fixed jump gate + heading EMA. `scripts/benchmark_target_filter.py` (race-line truth, DOPE-like noise, held-out tracks): median error 15 % lower now, 28-34 % lower 1-2 s ahead, 38 % on velocity, 28 % on heading, and 1.7 % of 5-15 m outliers accepted vs 6.8 %. Tuning: `ctra_turn_rate_noise` 0.2, `ctra_jerk_noise` 0.5, `ctra_heading_std_deg` 4 |
+| `target_filter` | ctra | heading-aided EKF (`target_ctra_ekf.py`: x, y, heading, speed, turn rate; along-track accel only with `ctra_estimate_accel`, off: an estimated acceleration carried the straight's +2 m/s^2 into braking zones and pushed the speed UP while the car braked -- the phantom car the MPC overran at a hairpin; measures DOPE position + flip-resolved heading) for the target position, velocity, acceleration, heading and yaw rate. The CV KF is not used: detections are gated by a chi-square test on the EKF's own prediction (`ctra_gate_nis` 25; the textbook 13.8 rejected 10 % of good frames because DOPE's drifting bias makes the EKF overconfident), the flip check's direction of travel comes from a line fit through the last 1 s of raw positions (independent of the heading), and z is an EMA of the measured z. `cv` = the previous KF + fixed jump gate + heading EMA. `scripts/benchmark_target_filter.py` (race-line truth, DOPE-like noise, held-out tracks): median error 15 % lower now, 28-34 % lower 1-2 s ahead, 38 % on velocity, 28 % on heading, and 1.7 % of 5-15 m outliers accepted vs 6.8 %. Tuning: `ctra_turn_rate_noise` 0.2, `ctra_jerk_noise` 0.5, `ctra_heading_std_deg` 4 |
 | `enable_heading_ukf` | false | the CTRV UKF flips its heading by 180 deg in turns with DOPE-level noise (crash bug fixed, filter still not usable) |
 
 Things that were tried and made it worse: `PSC_NE_JERK 20` (removed damping; the drone oscillated

@@ -10,6 +10,7 @@ Usage:
     ros2 launch circumnavigation_controller sim_launch.py
     ros2 launch circumnavigation_controller sim_launch.py detector:=dope
     ros2 launch circumnavigation_controller sim_launch.py world:=iris_monza
+    ros2 launch circumnavigation_controller sim_launch.py controller:=pid
     ros2 launch circumnavigation_controller sim_launch.py world:=iris_silverstone race:=true
 
 `world` is the world file name without .sdf (default iris_runway_new). The
@@ -18,6 +19,8 @@ file's <world name="..."> must equal it, since gz topic names contain it:
   iris_monza         - Monza race track (models/race_track_monza)
   iris_silverstone   - Silverstone race track (models/race_track_silverstone)
   iris_oschersleben  - Oschersleben race track (models/race_track_oschersleben)
+  iris_<track>_trees - the same tracks lined with trees that can block the
+                       drone's view of the car (tools/build_tree_worlds.py)
 
 `race:=true` (track worlds only) starts race_driver, which drives the car
 round the world's racing line (config/race_lines/<world>.csv) once the drone
@@ -201,6 +204,10 @@ def generate_launch_description():
                     'config/race_lines/<world>.csv, i.e. a race-track world)',
     )
 
+    controller_arg = DeclareLaunchArgument(
+        'controller', default_value='mpc', choices=['mpc', 'pid'],
+        description='Drone tracking controller: mpc (acados, ~/acados) or pid',
+    )
     use_sim_time_arg = DeclareLaunchArgument(
         'use_sim_time', default_value='true', choices=['true', 'false'],
         description='Run the ROS nodes on the Gazebo /clock',
@@ -396,7 +403,10 @@ def generate_launch_description():
             # (r=0.94), and 'horizon'/'auto' left a vertical error equal to the
             # drone pitch (slope -0.97, up to 31 deg). So use 'body'.
             'gimbal_attitude_frame': 'body',
+            'controller': LaunchConfiguration('controller'),
         }, SIM_TIME],
+        # drone_mpc.py loads acados from here (built once, see README).
+        additional_env={'ACADOS_SOURCE_DIR': os.path.join(HOME, 'acados')},
         prefix=['gnome-terminal --title="Relative Position Controller" --'],
         output='screen'
     )
@@ -455,6 +465,7 @@ def generate_launch_description():
         detector_arg,
         world_arg,
         use_sim_time_arg,
+        controller_arg,
         race_arg,
         kill_all_on_shutdown,
         set_gz_plugin_path,

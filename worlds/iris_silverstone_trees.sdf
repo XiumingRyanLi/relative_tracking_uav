@@ -1,0 +1,286 @@
+<?xml version="1.0" ?>
+<sdf version="1.9">
+  <world name="iris_silverstone_trees">
+    <physics name="1ms" type="ignore">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+    </physics>
+
+    <plugin filename="gz-sim-physics-system"
+      name="gz::sim::systems::Physics">
+    </plugin>
+    <plugin
+      filename="gz-sim-sensors-system"
+      name="gz::sim::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+    <plugin filename="gz-sim-user-commands-system"
+      name="gz::sim::systems::UserCommands">
+    </plugin>
+    <plugin filename="gz-sim-scene-broadcaster-system"
+      name="gz::sim::systems::SceneBroadcaster">
+    </plugin>
+    <plugin filename="gz-sim-imu-system"
+      name="gz::sim::systems::Imu">
+    </plugin>
+    <plugin filename="gz-sim-navsat-system"
+      name="gz::sim::systems::NavSat">
+    </plugin>
+
+    <scene>
+      <ambient>1.0 1.0 1.0</ambient>
+      <background>0.8 0.8 0.8</background>
+      <sky></sky>
+    </scene>
+
+    <spherical_coordinates>
+      <latitude_deg>-35.363262</latitude_deg>
+      <longitude_deg>149.165237</longitude_deg>
+      <elevation>584</elevation>
+      <heading_deg>0</heading_deg>
+      <surface_model>EARTH_WGS84</surface_model>
+    </spherical_coordinates>
+
+    <light type="directional" name="sun">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 10 0 0 0</pose>
+      <diffuse>0.8 0.8 0.8 1</diffuse>
+      <specular>0.8 0.8 0.8 1</specular>
+      <attenuation>
+        <range>1000</range>
+        <constant>0.9</constant>
+        <linear>0.01</linear>
+        <quadratic>0.001</quadratic>
+      </attenuation>
+      <direction>-0.5 0.1 -0.9</direction>
+    </light>
+
+    
+    <!-- Flat ground: the track mesh has no floor, cars drive on this plane. -->
+    <model name="ground_plane">
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <plane><normal>0 0 1</normal><size>3000 3000</size></plane>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <plane><normal>0 0 1</normal><size>3000 3000</size></plane>
+          </geometry>
+          <material>
+            <ambient>0.3 0.3 0.3 1</ambient>
+            <diffuse>0.3 0.3 0.3 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Silverstone (audubon_gazebo, x5 scale, repo models/race_track_silverstone).
+         Posed so the Hangar Straight (~150 m) runs along +y through the origin: the
+         drone (0,0) and car (0,20) spawn mid-lane. z lifts the mesh
+         (modelled below z=0) so its base sits on the ground plane. -->
+    <include>
+      <uri>model://race_track_silverstone</uri>
+      <pose>163.203 -18.297 1.573 0 0 2.4355</pose>
+    </include>
+
+    <include>
+      <!-- Iris + real 3-axis gimbal (repo models/iris_with_dope_gimbal).
+           Named iris_with_gimbal so gz topics keep that model name. -->
+      <uri>model://iris_with_dope_gimbal</uri>
+      <name>iris_with_gimbal</name>
+      <pose degrees="true">0 0 0.195 0 0 90</pose>
+    </include>
+
+    <!-- <include>
+      <uri>model://X1</uri>
+      <name>LandingVehicle</name>
+      <pose degrees="true">0 3 0.195 0 0 90</pose>
+    </include> -->
+    
+    <include>
+      <uri>model://audi_r8</uri>
+      <name>LandingVehicle</name>
+      <pose degrees="true">0 20 0.15 0 0 90</pose>
+    </include>
+
+    <!-- 173 trees/bushes from tools/build_tree_worlds.py (seed 1, density 1.0); visual only. -->
+    <include><uri>model://veg_bush_0</uri><name>veg_bush_0_0</name><pose>-67.26 150.16 0 0 0 1.812</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_1</name><pose>-59.37 158.90 0 0 0 -1.380</pose></include>
+    <include><uri>model://veg_tree_5</uri><name>veg_tree_5_2</name><pose>-46.35 146.21 0 0 0 -2.414</pose></include>
+    <include><uri>model://veg_tree_5</uri><name>veg_tree_5_3</name><pose>-64.03 119.47 0 0 0 2.216</pose></include>
+    <include><uri>model://veg_bush_0</uri><name>veg_bush_0_4</name><pose>-42.78 148.69 0 0 0 2.232</pose></include>
+    <include><uri>model://veg_bush_0</uri><name>veg_bush_0_5</name><pose>-69.92 125.67 0 0 0 -2.748</pose></include>
+    <include><uri>model://veg_bush_0</uri><name>veg_bush_0_6</name><pose>-79.15 136.50 0 0 0 -3.105</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_7</name><pose>-85.65 131.07 0 0 0 0.830</pose></include>
+    <include><uri>model://veg_bush_0</uri><name>veg_bush_0_8</name><pose>-71.11 152.98 0 0 0 -2.682</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_9</name><pose>-97.09 94.99 0 0 0 -0.277</pose></include>
+    <include><uri>model://veg_bush_0</uri><name>veg_bush_0_10</name><pose>-85.04 110.74 0 0 0 -0.073</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_11</name><pose>-40.03 143.09 0 0 0 -1.961</pose></include>
+    <include><uri>model://veg_tree_3</uri><name>veg_tree_3_12</name><pose>-113.09 109.34 0 0 0 0.135</pose></include>
+    <include><uri>model://veg_tree_9</uri><name>veg_tree_9_13</name><pose>-92.03 126.04 0 0 0 -1.348</pose></include>
+    <include><uri>model://veg_tree_3</uri><name>veg_tree_3_14</name><pose>-52.42 163.06 0 0 0 -2.557</pose></include>
+    <include><uri>model://veg_tree_9</uri><name>veg_tree_9_15</name><pose>-70.12 118.71 0 0 0 2.808</pose></include>
+    <include><uri>model://veg_bush_0</uri><name>veg_bush_0_16</name><pose>-60.48 130.73 0 0 0 0.140</pose></include>
+    <include><uri>model://veg_tree_5</uri><name>veg_tree_5_17</name><pose>-62.91 149.84 0 0 0 0.272</pose></include>
+    <include><uri>model://veg_bush_0</uri><name>veg_bush_0_18</name><pose>-76.32 140.41 0 0 0 -1.390</pose></include>
+    <include><uri>model://veg_tree_5</uri><name>veg_tree_5_19</name><pose>-56.76 137.63 0 0 0 -0.668</pose></include>
+    <include><uri>model://veg_bush_1</uri><name>veg_bush_1_20</name><pose>-76.94 112.67 0 0 0 -1.178</pose></include>
+    <include><uri>model://veg_tree_3</uri><name>veg_tree_3_21</name><pose>-65.34 127.25 0 0 0 -1.333</pose></include>
+    <include><uri>model://veg_bush_1</uri><name>veg_bush_1_22</name><pose>-78.18 143.80 0 0 0 1.918</pose></include>
+    <include><uri>model://veg_tree_9</uri><name>veg_tree_9_23</name><pose>0.48 -130.88 0 0 0 -0.274</pose></include>
+    <include><uri>model://veg_bush_1</uri><name>veg_bush_1_24</name><pose>15.32 -183.49 0 0 0 -2.105</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_25</name><pose>28.33 -167.08 0 0 0 -2.290</pose></include>
+    <include><uri>model://veg_bush_0</uri><name>veg_bush_0_26</name><pose>27.54 -173.77 0 0 0 -1.177</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_27</name><pose>28.66 -154.12 0 0 0 -1.130</pose></include>
+    <include><uri>model://veg_bush_0</uri><name>veg_bush_0_28</name><pose>-18.27 -139.93 0 0 0 -0.542</pose></include>
+    <include><uri>model://veg_tree_9</uri><name>veg_tree_9_29</name><pose>-28.41 -141.13 0 0 0 2.928</pose></include>
+    <include><uri>model://veg_bush_0</uri><name>veg_bush_0_30</name><pose>1.20 -154.83 0 0 0 -2.038</pose></include>
+    <include><uri>model://veg_tree_1</uri><name>veg_tree_1_31</name><pose>-12.02 -142.96 0 0 0 0.157</pose></include>
+    <include><uri>model://veg_tree_5</uri><name>veg_tree_5_32</name><pose>-2.44 -155.37 0 0 0 -1.679</pose></include>
+    <include><uri>model://veg_tree_3</uri><name>veg_tree_3_33</name><pose>-6.40 -148.43 0 0 0 -0.958</pose></include>
+    <include><uri>model://veg_bush_1</uri><name>veg_bush_1_34</name><pose>-13.48 -118.25 0 0 0 -0.423</pose></include>
+    <include><uri>model://veg_bush_1</uri><name>veg_bush_1_35</name><pose>-23.62 -139.09 0 0 0 2.196</pose></include>
+    <include><uri>model://veg_bush_0</uri><name>veg_bush_0_36</name><pose>5.39 -179.28 0 0 0 -2.307</pose></include>
+    <include><uri>model://veg_tree_5</uri><name>veg_tree_5_37</name><pose>7.86 -170.47 0 0 0 2.109</pose></include>
+    <include><uri>model://veg_bush_0</uri><name>veg_bush_0_38</name><pose>5.89 -160.85 0 0 0 2.272</pose></include>
+    <include><uri>model://veg_tree_3</uri><name>veg_tree_3_39</name><pose>-17.66 -145.32 0 0 0 1.380</pose></include>
+    <include><uri>model://veg_bush_0</uri><name>veg_bush_0_40</name><pose>6.40 -164.37 0 0 0 1.891</pose></include>
+    <include><uri>model://veg_tree_5</uri><name>veg_tree_5_41</name><pose>1.51 -160.34 0 0 0 -1.925</pose></include>
+    <include><uri>model://veg_bush_1</uri><name>veg_bush_1_42</name><pose>-8.42 -122.29 0 0 0 -2.861</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_43</name><pose>90.38 -170.90 0 0 0 -2.694</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_44</name><pose>149.25 -183.35 0 0 0 2.543</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_45</name><pose>99.09 -196.24 0 0 0 2.928</pose></include>
+    <include><uri>model://veg_tree_3</uri><name>veg_tree_3_46</name><pose>126.20 -197.83 0 0 0 1.097</pose></include>
+    <include><uri>model://veg_bush_1</uri><name>veg_bush_1_47</name><pose>143.63 -177.56 0 0 0 2.129</pose></include>
+    <include><uri>model://veg_tree_9</uri><name>veg_tree_9_48</name><pose>133.80 -182.85 0 0 0 -0.998</pose></include>
+    <include><uri>model://veg_bush_1</uri><name>veg_bush_1_49</name><pose>169.07 -188.17 0 0 0 -2.879</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_50</name><pose>183.12 -210.50 0 0 0 -1.072</pose></include>
+    <include><uri>model://veg_tree_1</uri><name>veg_tree_1_51</name><pose>175.33 -187.87 0 0 0 -0.198</pose></include>
+    <include><uri>model://veg_bush_1</uri><name>veg_bush_1_52</name><pose>169.23 -192.17 0 0 0 2.394</pose></include>
+    <include><uri>model://veg_bush_0</uri><name>veg_bush_0_53</name><pose>108.94 -176.59 0 0 0 0.597</pose></include>
+    <include><uri>model://veg_tree_5</uri><name>veg_tree_5_54</name><pose>118.10 -195.26 0 0 0 1.727</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_55</name><pose>145.26 -204.75 0 0 0 0.658</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_56</name><pose>75.75 -187.05 0 0 0 2.287</pose></include>
+    <include><uri>model://veg_bush_1</uri><name>veg_bush_1_57</name><pose>141.24 -186.08 0 0 0 -2.127</pose></include>
+    <include><uri>model://veg_tree_3</uri><name>veg_tree_3_58</name><pose>105.25 -169.66 0 0 0 -1.160</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_59</name><pose>159.42 -205.46 0 0 0 -0.717</pose></include>
+    <include><uri>model://veg_bush_1</uri><name>veg_bush_1_60</name><pose>131.72 -203.53 0 0 0 0.501</pose></include>
+    <include><uri>model://veg_tree_3</uri><name>veg_tree_3_61</name><pose>82.69 -171.98 0 0 0 0.749</pose></include>
+    <include><uri>model://veg_tree_5</uri><name>veg_tree_5_62</name><pose>165.63 -184.15 0 0 0 1.259</pose></include>
+    <include><uri>model://veg_bush_0</uri><name>veg_bush_0_63</name><pose>91.50 -196.54 0 0 0 -3.042</pose></include>
+    <include><uri>model://veg_tree_9</uri><name>veg_tree_9_64</name><pose>109.63 -201.38 0 0 0 0.414</pose></include>
+    <include><uri>model://veg_bush_1</uri><name>veg_bush_1_65</name><pose>182.62 -190.58 0 0 0 2.805</pose></include>
+    <include><uri>model://veg_tree_9</uri><name>veg_tree_9_66</name><pose>116.12 -173.62 0 0 0 -2.962</pose></include>
+    <include><uri>model://veg_tree_1</uri><name>veg_tree_1_67</name><pose>86.09 -192.26 0 0 0 0.600</pose></include>
+    <include><uri>model://veg_tree_3</uri><name>veg_tree_3_68</name><pose>163.03 -214.95 0 0 0 2.898</pose></include>
+    <include><uri>model://veg_bush_0</uri><name>veg_bush_0_69</name><pose>123.38 -171.24 0 0 0 -2.103</pose></include>
+    <include><uri>model://veg_tree_5</uri><name>veg_tree_5_70</name><pose>182.54 -196.33 0 0 0 -0.180</pose></include>
+    <include><uri>model://veg_tree_9</uri><name>veg_tree_9_71</name><pose>98.96 -173.28 0 0 0 -0.892</pose></include>
+    <include><uri>model://veg_tree_5</uri><name>veg_tree_5_72</name><pose>106.54 -191.87 0 0 0 0.580</pose></include>
+    <include><uri>model://veg_bush_1</uri><name>veg_bush_1_73</name><pose>364.09 -28.13 0 0 0 -1.030</pose></include>
+    <include><uri>model://veg_bush_0</uri><name>veg_bush_0_74</name><pose>322.07 -22.88 0 0 0 2.919</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_75</name><pose>359.22 -83.83 0 0 0 2.148</pose></include>
+    <include><uri>model://veg_tree_5</uri><name>veg_tree_5_76</name><pose>350.62 -44.61 0 0 0 2.383</pose></include>
+    <include><uri>model://veg_tree_5</uri><name>veg_tree_5_77</name><pose>333.23 -19.34 0 0 0 -1.536</pose></include>
+    <include><uri>model://veg_tree_1</uri><name>veg_tree_1_78</name><pose>329.28 -24.33 0 0 0 0.779</pose></include>
+    <include><uri>model://veg_tree_3</uri><name>veg_tree_3_79</name><pose>352.51 -59.66 0 0 0 -1.247</pose></include>
+    <include><uri>model://veg_tree_9</uri><name>veg_tree_9_80</name><pose>351.31 -82.97 0 0 0 -0.785</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_81</name><pose>317.23 -18.13 0 0 0 0.545</pose></include>
+    <include><uri>model://veg_tree_9</uri><name>veg_tree_9_82</name><pose>341.17 -66.90 0 0 0 2.026</pose></include>
+    <include><uri>model://veg_tree_1</uri><name>veg_tree_1_83</name><pose>339.99 -5.02 0 0 0 -0.597</pose></include>
+    <include><uri>model://veg_bush_0</uri><name>veg_bush_0_84</name><pose>374.25 -63.95 0 0 0 2.422</pose></include>
+    <include><uri>model://veg_tree_1</uri><name>veg_tree_1_85</name><pose>322.18 -1.89 0 0 0 -2.732</pose></include>
+    <include><uri>model://veg_tree_5</uri><name>veg_tree_5_86</name><pose>341.68 -24.95 0 0 0 -2.156</pose></include>
+    <include><uri>model://veg_tree_9</uri><name>veg_tree_9_87</name><pose>334.19 -5.06 0 0 0 1.731</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_88</name><pose>346.28 -34.08 0 0 0 -1.063</pose></include>
+    <include><uri>model://veg_tree_1</uri><name>veg_tree_1_89</name><pose>340.47 -29.83 0 0 0 0.643</pose></include>
+    <include><uri>model://veg_tree_1</uri><name>veg_tree_1_90</name><pose>361.83 -22.80 0 0 0 -0.534</pose></include>
+    <include><uri>model://veg_tree_3</uri><name>veg_tree_3_91</name><pose>329.76 -79.91 0 0 0 1.484</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_92</name><pose>333.79 -65.31 0 0 0 0.454</pose></include>
+    <include><uri>model://veg_tree_5</uri><name>veg_tree_5_93</name><pose>356.28 -64.12 0 0 0 3.119</pose></include>
+    <include><uri>model://veg_tree_5</uri><name>veg_tree_5_94</name><pose>377.79 -52.89 0 0 0 -2.097</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_95</name><pose>355.48 -51.08 0 0 0 1.590</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_96</name><pose>370.09 -41.49 0 0 0 0.520</pose></include>
+    <include><uri>model://veg_bush_1</uri><name>veg_bush_1_97</name><pose>377.72 -42.28 0 0 0 -0.404</pose></include>
+    <include><uri>model://veg_bush_0</uri><name>veg_bush_0_98</name><pose>374.07 -58.83 0 0 0 -0.145</pose></include>
+    <include><uri>model://veg_tree_5</uri><name>veg_tree_5_99</name><pose>332.30 -72.22 0 0 0 -3.112</pose></include>
+    <include><uri>model://veg_bush_0</uri><name>veg_bush_0_100</name><pose>371.48 -47.28 0 0 0 -1.482</pose></include>
+    <include><uri>model://veg_tree_5</uri><name>veg_tree_5_101</name><pose>367.41 -82.61 0 0 0 -2.852</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_102</name><pose>352.28 -8.01 0 0 0 2.780</pose></include>
+    <include><uri>model://veg_tree_5</uri><name>veg_tree_5_103</name><pose>176.81 -17.04 0 0 0 0.994</pose></include>
+    <include><uri>model://veg_tree_5</uri><name>veg_tree_5_104</name><pose>154.55 -9.52 0 0 0 -2.697</pose></include>
+    <include><uri>model://veg_tree_1</uri><name>veg_tree_1_105</name><pose>255.06 8.75 0 0 0 -2.383</pose></include>
+    <include><uri>model://veg_tree_1</uri><name>veg_tree_1_106</name><pose>218.00 -11.60 0 0 0 -2.227</pose></include>
+    <include><uri>model://veg_tree_1</uri><name>veg_tree_1_107</name><pose>192.57 12.09 0 0 0 0.434</pose></include>
+    <include><uri>model://veg_tree_5</uri><name>veg_tree_5_108</name><pose>159.57 -27.29 0 0 0 -1.083</pose></include>
+    <include><uri>model://veg_tree_9</uri><name>veg_tree_9_109</name><pose>244.00 -20.64 0 0 0 -3.062</pose></include>
+    <include><uri>model://veg_tree_9</uri><name>veg_tree_9_110</name><pose>184.66 14.64 0 0 0 -2.118</pose></include>
+    <include><uri>model://veg_tree_9</uri><name>veg_tree_9_111</name><pose>250.87 -17.90 0 0 0 -1.403</pose></include>
+    <include><uri>model://veg_tree_9</uri><name>veg_tree_9_112</name><pose>146.38 -22.14 0 0 0 0.360</pose></include>
+    <include><uri>model://veg_tree_1</uri><name>veg_tree_1_113</name><pose>207.99 6.20 0 0 0 2.270</pose></include>
+    <include><uri>model://veg_bush_1</uri><name>veg_bush_1_114</name><pose>159.13 -32.18 0 0 0 2.257</pose></include>
+    <include><uri>model://veg_bush_0</uri><name>veg_bush_0_115</name><pose>194.97 8.93 0 0 0 0.279</pose></include>
+    <include><uri>model://veg_bush_1</uri><name>veg_bush_1_116</name><pose>255.17 -21.83 0 0 0 1.602</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_117</name><pose>173.05 12.65 0 0 0 -1.546</pose></include>
+    <include><uri>model://veg_bush_0</uri><name>veg_bush_0_118</name><pose>167.08 -20.41 0 0 0 -3.077</pose></include>
+    <include><uri>model://veg_tree_5</uri><name>veg_tree_5_119</name><pose>230.93 9.42 0 0 0 -1.852</pose></include>
+    <include><uri>model://veg_bush_1</uri><name>veg_bush_1_120</name><pose>180.28 -7.14 0 0 0 -0.548</pose></include>
+    <include><uri>model://veg_tree_3</uri><name>veg_tree_3_121</name><pose>198.33 5.38 0 0 0 -2.839</pose></include>
+    <include><uri>model://veg_tree_1</uri><name>veg_tree_1_122</name><pose>227.46 -15.48 0 0 0 2.487</pose></include>
+    <include><uri>model://veg_tree_5</uri><name>veg_tree_5_123</name><pose>234.17 -15.08 0 0 0 -0.748</pose></include>
+    <include><uri>model://veg_bush_0</uri><name>veg_bush_0_124</name><pose>235.56 3.73 0 0 0 0.970</pose></include>
+    <include><uri>model://veg_tree_3</uri><name>veg_tree_3_125</name><pose>154.49 -1.46 0 0 0 -0.370</pose></include>
+    <include><uri>model://veg_tree_3</uri><name>veg_tree_3_126</name><pose>213.29 -17.19 0 0 0 2.239</pose></include>
+    <include><uri>model://veg_tree_5</uri><name>veg_tree_5_127</name><pose>136.30 -23.09 0 0 0 -1.053</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_128</name><pose>150.77 -15.17 0 0 0 0.421</pose></include>
+    <include><uri>model://veg_tree_5</uri><name>veg_tree_5_129</name><pose>192.55 -14.31 0 0 0 -0.048</pose></include>
+    <include><uri>model://veg_bush_1</uri><name>veg_bush_1_130</name><pose>155.82 -35.93 0 0 0 -1.407</pose></include>
+    <include><uri>model://veg_tree_9</uri><name>veg_tree_9_131</name><pose>168.16 3.69 0 0 0 -1.891</pose></include>
+    <include><uri>model://veg_bush_1</uri><name>veg_bush_1_132</name><pose>179.42 -11.80 0 0 0 0.081</pose></include>
+    <include><uri>model://veg_bush_0</uri><name>veg_bush_0_133</name><pose>184.28 -8.31 0 0 0 1.809</pose></include>
+    <include><uri>model://veg_tree_3</uri><name>veg_tree_3_134</name><pose>188.23 8.18 0 0 0 1.952</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_135</name><pose>-11.50 72.67 0 0 0 2.998</pose></include>
+    <include><uri>model://veg_tree_3</uri><name>veg_tree_3_136</name><pose>-8.96 108.13 0 0 0 0.175</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_137</name><pose>-0.01 138.95 0 0 0 0.757</pose></include>
+    <include><uri>model://veg_tree_3</uri><name>veg_tree_3_138</name><pose>45.57 139.78 0 0 0 1.607</pose></include>
+    <include><uri>model://veg_tree_9</uri><name>veg_tree_9_139</name><pose>80.21 130.32 0 0 0 -1.760</pose></include>
+    <include><uri>model://veg_tree_3</uri><name>veg_tree_3_140</name><pose>61.97 148.38 0 0 0 -2.879</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_141</name><pose>19.78 163.27 0 0 0 -0.391</pose></include>
+    <include><uri>model://veg_tree_9</uri><name>veg_tree_9_142</name><pose>-0.47 181.40 0 0 0 -1.542</pose></include>
+    <include><uri>model://veg_tree_1</uri><name>veg_tree_1_143</name><pose>-47.14 166.15 0 0 0 1.486</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_144</name><pose>-123.31 101.04 0 0 0 -2.530</pose></include>
+    <include><uri>model://veg_tree_3</uri><name>veg_tree_3_145</name><pose>-140.04 55.38 0 0 0 -0.470</pose></include>
+    <include><uri>model://veg_tree_3</uri><name>veg_tree_3_146</name><pose>-135.89 21.19 0 0 0 -2.377</pose></include>
+    <include><uri>model://veg_tree_1</uri><name>veg_tree_1_147</name><pose>-130.36 12.47 0 0 0 1.449</pose></include>
+    <include><uri>model://veg_tree_9</uri><name>veg_tree_9_148</name><pose>-116.95 -35.34 0 0 0 -1.021</pose></include>
+    <include><uri>model://veg_tree_1</uri><name>veg_tree_1_149</name><pose>-85.25 -45.22 0 0 0 1.205</pose></include>
+    <include><uri>model://veg_tree_1</uri><name>veg_tree_1_150</name><pose>-65.59 -63.89 0 0 0 2.402</pose></include>
+    <include><uri>model://veg_tree_1</uri><name>veg_tree_1_151</name><pose>-41.19 -96.30 0 0 0 -0.491</pose></include>
+    <include><uri>model://veg_tree_5</uri><name>veg_tree_5_152</name><pose>63.04 -192.45 0 0 0 1.015</pose></include>
+    <include><uri>model://veg_tree_9</uri><name>veg_tree_9_153</name><pose>244.00 -225.39 0 0 0 0.585</pose></include>
+    <include><uri>model://veg_tree_5</uri><name>veg_tree_5_154</name><pose>278.22 -217.98 0 0 0 -1.794</pose></include>
+    <include><uri>model://veg_tree_5</uri><name>veg_tree_5_155</name><pose>289.85 -238.15 0 0 0 -2.324</pose></include>
+    <include><uri>model://veg_tree_3</uri><name>veg_tree_3_156</name><pose>327.00 -224.29 0 0 0 2.825</pose></include>
+    <include><uri>model://veg_tree_1</uri><name>veg_tree_1_157</name><pose>349.85 -221.04 0 0 0 -2.447</pose></include>
+    <include><uri>model://veg_tree_1</uri><name>veg_tree_1_158</name><pose>350.78 -192.05 0 0 0 2.396</pose></include>
+    <include><uri>model://veg_tree_5</uri><name>veg_tree_5_159</name><pose>337.43 -152.26 0 0 0 1.184</pose></include>
+    <include><uri>model://veg_bush_0</uri><name>veg_bush_0_160</name><pose>333.87 -97.95 0 0 0 -0.000</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_161</name><pose>330.97 -89.83 0 0 0 1.753</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_162</name><pose>275.25 -0.65 0 0 0 1.535</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_163</name><pose>268.88 -14.19 0 0 0 -1.075</pose></include>
+    <include><uri>model://veg_bush_0</uri><name>veg_bush_0_164</name><pose>136.40 -56.29 0 0 0 -2.848</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_165</name><pose>92.74 -74.18 0 0 0 0.609</pose></include>
+    <include><uri>model://veg_tree_1</uri><name>veg_tree_1_166</name><pose>49.12 -65.32 0 0 0 2.498</pose></include>
+    <include><uri>model://veg_tree_9</uri><name>veg_tree_9_167</name><pose>54.15 -91.11 0 0 0 1.449</pose></include>
+    <include><uri>model://veg_bush_0</uri><name>veg_bush_0_168</name><pose>49.29 -117.33 0 0 0 -2.496</pose></include>
+    <include><uri>model://veg_bush_0</uri><name>veg_bush_0_169</name><pose>18.05 -124.01 0 0 0 2.368</pose></include>
+    <include><uri>model://veg_bush_1</uri><name>veg_bush_1_170</name><pose>16.37 -96.39 0 0 0 1.572</pose></include>
+    <include><uri>model://veg_bush_1</uri><name>veg_bush_1_171</name><pose>10.73 -64.75 0 0 0 2.896</pose></include>
+    <include><uri>model://veg_tree_1</uri><name>veg_tree_1_172</name><pose>9.15 -40.39 0 0 0 -0.310</pose></include>
+
+  </world>
+</sdf>

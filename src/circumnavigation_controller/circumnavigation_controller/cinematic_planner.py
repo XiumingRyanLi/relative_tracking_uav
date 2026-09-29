@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import copy
 import math
 from dataclasses import dataclass
 from collections import deque
@@ -85,6 +86,15 @@ class CinematicPlanner:
                 self.add_action(transition)
         for action in actions:
             self.add_action(action)
+
+    def preview(self, times):
+        """Shot offsets at future times (ascending, >= the last update's time)
+        without advancing the real sequence: an MPC plans against where the
+        shot point is going, not only where it is now."""
+        sim = copy.copy(self)
+        sim.queue = deque(self.queue)
+        sim.previous_offset = copy.copy(self.previous_offset)
+        return [sim.update(t) for t in times]
 
     def _make_transition(self, frm: CinematicOffset, to: CinematicOffset):
         """Action flying around the car from `frm` to `to`, None if already there."""

@@ -177,28 +177,34 @@ class FlightSequencer:
             self.initiate_rtl(f"boundary violation ({x:.1f}, {y:.1f})")
 
     def initiate_rtl(self, reason: str):
+        self.end_flight("RTL", f"SAFETY RTL: {reason}")
+
+    def end_flight(self, mode: str, reason: str):
+        """Hand the drone back to ArduPilot in `mode` (RTL: fly home and land;
+        LAND: land where it is) and stop tracking for good. rtl_initiated is
+        set either way: it means "the flight is ending, stop sending setpoints"."""
         if self.rtl_initiated:
             return
         self.rtl_initiated = True
         self.tracking_enabled = False
-        self._log.warning(f"SAFETY RTL: {reason}")
+        self._log.warning(f"{mode}: {reason}")
 
         if not self.set_mode_client.wait_for_service(timeout_sec=1.0):
-            self._log.error("SetMode service not ready for RTL.")
+            self._log.error(f"SetMode service not ready for {mode}.")
             return
         req = SetMode.Request()
-        req.custom_mode = "RTL"
+        req.custom_mode = mode
         self.set_mode_client.call_async(req).add_done_callback(
-            lambda f: self._on_rtl_done(f, reason)
+            lambda f: self._on_end_mode_done(f, mode, reason)
         )
 
-    def _on_rtl_done(self, fut, reason):
+    def _on_end_mode_done(self, fut, mode, reason):
         try:
             res = fut.result()
         except Exception as e:
-            self._log.error(f"RTL error: {e}")
+            self._log.error(f"{mode} error: {e}")
             return
         if getattr(res, "mode_sent", False):
-            self._log.info(f"RTL accepted ({reason})")
+            self._log.info(f"{mode} accepted ({reason})")
         else:
-            self._log.error(f"RTL rejected ({reason})")
+            self._log.error(f"{mode} rejected ({reason})")

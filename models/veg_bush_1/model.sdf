@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<sdf version="1.9">
+  <!-- bush_1 from gazebo-vegetation (free3d.com meshes), visual only: it blocks
+       the drone's view but has no collision, so the drone can't crash into
+       it and dozens of copies stay cheap for physics. The OBJ is Y-up, so
+       the link (not the model, whose pose an <include> overrides) is rolled
+       90 deg to stand it upright. -->
+  <model name="veg_bush_1">
+    <static>true</static>
+    <link name="link">
+      <pose>0 0 0 1.5708 0 0</pose>
+      <visual name="visual">
+        <geometry>
+          <mesh>
+            <uri>model://veg_bush_1/meshes/bush_1.obj</uri>
+            <scale>5 5 5</scale>
+          </mesh>
+        </geometry>
+      </visual>
+    </link>
+  </model>
+</sdf>

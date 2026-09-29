@@ -18,6 +18,7 @@ _publish_setpoint (drone velocity) and _publish_gimbal_setpoint (gimbal).
 """
 import json
 import math
+import os
 
 import numpy as np
 if not hasattr(np, "float"):
@@ -49,6 +50,7 @@ try:
     from .pid_controller import PIDRelativeController
     from .run_logger import RunLogger
     from .target_estimator import Detection, TargetEstimator
+    from .target_prediction import CoastParams, CoastScan, predict_car, predict_horizon, range_scenarios
 except ImportError:
     from camera_frames import (
         GIMBAL_ATTITUDE_FRAMES, gimbal_camera_transform, pose_matrix,
@@ -64,6 +66,7 @@ except ImportError:
     from pid_controller import PIDRelativeController
     from run_logger import RunLogger
     from target_estimator import Detection, TargetEstimator
+    from target_prediction import CoastParams, CoastScan, predict_car, predict_horizon, range_scenarios
 
 # Standoff is bounded by the camera, not the controller: with the sim
 # camera's 0.8 rad HFOV the visible width is 0.845 * range, so a side-on Audi
@@ -106,6 +109,11 @@ class RelativePositionController(Node):
                 f"gimbal_attitude_frame must be one of {GIMBAL_ATTITUDE_FRAMES}, "
                 f"got '{self.gimbal_attitude_frame}'"
             )
+        self.controller_type = str(cfg.controller).lower()
+        if self.controller_type not in ("pid", "mpc"):
+            raise ValueError(f"controller must be 'pid' or 'mpc', got '{cfg.controller}'")
+        if str(cfg.search_timeout_action).upper() not in ("LAND", "RTL"):
+            raise ValueError(f"search_timeout_action must be LAND or RTL, got '{cfg.search_timeout_action}'")
         if str(cfg.target_filter).lower() not in ("ctra", "cv"):
             raise ValueError(f"target_filter must be 'ctra' or 'cv', got '{cfg.target_filter}'")
         self.T_gimbal_camera = gimbal_camera_transform(
@@ -125,6 +133,21 @@ class RelativePositionController(Node):
             ki_xy=cfg.pid_ki_xy,
             max_integral_xy=cfg.pid_max_integral_xy,
         )
+        # MPC (controller:=mpc): acados solver for the drone velocity/yaw-rate
+        # command. The PID above stays for search/hold and as the fallback.
+        self.mpc_tracker = None
+        self._last_cmd = np.zeros(4)          # [vx vy vz yaw_rate] last sent
+        self._drone_vel = np.zeros(3)
+        self._drone_yaw_rate = 0.0
+        self.have_drone_vel = False
+        self._mpc_failures = 0
+        if self.controller_type == "mpc":
+            self._init_mpc()
+        # Gimbal yaw sweep around the predicted car while it is hidden.
+        self.coast_scan = (CoastScan(half_fov_deg=cfg.coast_scan_half_fov_deg, sigma_k=cfg.coast_scan_sigma,
+                                     max_deg=cfg.coast_scan_max_deg, rate_deg=cfg.coast_scan_rate_deg)
+                           if cfg.coast_scan_enable else None)
+        self._coast_scan_time = None
         self.gimbal_ctrl = GimbalController(
             kp_yaw=cfg.gimbal_kp_yaw,
             kd_yaw=cfg.gimbal_kd_yaw,
@@ -173,6 +196,9 @@ class RelativePositionController(Node):
             ctra_s_jerk=cfg.ctra_jerk_noise,
             ctra_heading_std=math.radians(cfg.ctra_heading_std_deg),
             ctra_gate_nis=cfg.ctra_gate_nis,
+            ctra_estimate_accel=bool(cfg.ctra_estimate_accel),
+            ctra_speed_noise=cfg.ctra_speed_noise,
+            ctra_reacquire_sec=cfg.ctra_reacquire_sec,
             ukf_coast_timeout_sec=cfg.ukf_coast_timeout_sec,
             ukf_std_a=cfg.ukf_std_a,
             ukf_std_yawdd=cfg.ukf_std_yawdd,
@@ -236,6 +262,9 @@ class RelativePositionController(Node):
             self._on_gimbal_attitude_status, 10,
         )
         self.create_subscription(Odometry, "/aruco_target/visual_odom", self._on_visual_odom, 10)
+        self.create_subscription(
+            TwistStamped, "/mavros/local_position/velocity_local", self._on_drone_velocity, best_effort_qos
+        )
         self.create_subscription(
             String, cfg.cinematic_command_topic, self._on_cinematic_command, reliable_qos
         )
@@ -341,42 +370,23 @@ class RelativePositionController(Node):
             paused += now - self._coast_start_time
         return now - paused
 
-    def _predicted_target(self, now: float):
-        """Target (x, y, z) carried on from its last estimate at its last
-        velocity, plus how much of that velocity still applies now (1 -> 0).
+    def _coast_params(self) -> CoastParams:
+        cfg = self.cfg
+        return CoastParams(cfg.coast_full_speed_sec, cfg.coast_taper_sec,
+                           cfg.coast_max_distance, cfg.coast_turn_fade_sec)
 
-        The estimate only moves on detections. The prediction runs at full
-        speed for coast_full_speed_sec, slows to a stop over coast_taper_sec
-        and never moves more than coast_max_distance from the last estimate.
-        Between normal detections it is a small correction.
-        """
+    def _predicted_target(self, now: float):
+        """Car (x, y, z, velocity share, heading) now, carried on from the
+        last estimate's capture time (target_prediction.predict_car): the
+        detection latency between detections, and through a loss the CTRA
+        prediction (speed kept, turn rate fading, heading moving with it) at
+        full speed for coast_full_speed_sec, then slowing to a stop."""
         target = self.estimator
         if self.detection is None:
-            return target.x, target.y, target.z, 0.0
-        cfg = self.cfg
-        # The estimate is where the car was when the frame was captured; the
-        # car has moved on by the detection latency since (it trailed the car
-        # by 0.7-0.8 m at 11 m/s, runs 20260928_145616/150220). Carry it on
-        # from the capture time -- unless the stamp is in another clock
-        # domain (use_sim_time mismatch), then from when it was received.
-        dt = now - self.detection.stamp_sec
-        if not 0.0 <= dt <= now - self.detection.received_time + 1.0:
-            dt = now - self.detection.received_time
-        dt = max(0.0, dt)
-        t_full, t_taper = cfg.coast_full_speed_sec, max(cfg.coast_taper_sec, 1e-3)
-        if dt <= t_full:
-            travel_sec, rate = dt, 1.0
-        elif dt < t_full + t_taper:
-            e = dt - t_full
-            travel_sec, rate = t_full + e - e * e / (2.0 * t_taper), 1.0 - e / t_taper
-        else:
-            travel_sec, rate = t_full + 0.5 * t_taper, 0.0
-        dx, dy = target.vx * travel_sec, target.vy * travel_sec
-        dist = math.hypot(dx, dy)
-        if dist > cfg.coast_max_distance:
-            dx, dy = dx * cfg.coast_max_distance / dist, dy * cfg.coast_max_distance / dist
-            rate = 0.0
-        return target.x + dx, target.y + dy, target.z, rate
+            return target.x, target.y, target.z, 0.0, target.heading
+        xs, ys, psi, _, rate = predict_car(target, self.detection, [now], self._coast_params(),
+                                           extend_uncertainty=False)
+        return float(xs[0]), float(ys[0]), target.z, float(rate[0]), float(psi[0])
 
     def _log_row(self, now, stage, drone_xyz, desired_xyz, errors, command):
         self.run_log.log(
@@ -582,7 +592,7 @@ class RelativePositionController(Node):
                 "Tracking enabled but no visual target received, holding.",
                 throttle_duration_sec=5.0,
             )
-            self.vel_pub.publish(msg)   # zero velocity
+            self._send_velocity(msg, (0.0, 0.0, 0.0, 0.0), now)   # zero velocity
             self._log_row(now, "hold", drone_xyz, drone_xyz, (0.0, 0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0))
             return
 
@@ -597,7 +607,7 @@ class RelativePositionController(Node):
         # the height it had when the target was lost and the shot sequence
         # waits, so it resumes where it left off on re-acquisition.
         coasting = self._update_coast(now, drone_z)
-        target_x, target_y, _, velocity_scale = self._predicted_target(now)
+        target_x, target_y, _, velocity_scale, predicted_heading = self._predicted_target(now)
 
         # Desired position = target position + shot offset rotated by the
         # target heading (predicted ahead by its filter lag + detection
@@ -605,8 +615,11 @@ class RelativePositionController(Node):
         # target.z: the car is on the ground, and target.z is a noisy estimate
         # of its box centre (~0.6 m up) that the altitude would otherwise chase.
         shot_offset = self.cinematic_planner.update(self._shot_clock(now))
+        # Coasting: the heading follows the prediction (the car may be turning
+        # behind the obstacle); no extra yaw-rate lead.
         yaw_rate = 0.0 if coasting else target.yaw_rate
-        shot_heading = target.heading + yaw_rate * self.cfg.heading_prediction_sec
+        shot_heading = (predicted_heading if coasting
+                        else target.heading + yaw_rate * self.cfg.heading_prediction_sec)
         rel_x_world, rel_y_world = body_to_world(shot_offset.x, shot_offset.y, shot_heading)
         desired_x = target_x + rel_x_world
         desired_y = target_y + rel_y_world
@@ -634,6 +647,21 @@ class RelativePositionController(Node):
             throttle_duration_sec=0.5,
         )
 
+        if self.mpc_tracker is not None:
+            mpc_cmd = self._mpc_command(now, coasting, shot_offset, drone_xyz)
+            if mpc_cmd is not None:
+                self._send_velocity(msg, mpc_cmd, now, from_mpc=True)
+                self._log_row(
+                    now, "coast" if coasting else "stage2", drone_xyz,
+                    (desired_x, desired_y, desired_z),
+                    (ex, ey, ez, math.degrees(eyaw)),
+                    tuple(float(v) for v in mpc_cmd),
+                )
+                return
+            # MPC unavailable this cycle: the PID flies it, starting from the
+            # command the drone is already following.
+            self.pid.reset(current_velocity=tuple(self._last_cmd[:3]))
+
         # Feedforward = velocity of the shot point (no vertical: fixed
         # altitude): the car's velocity plus, in a turn, yaw rate x offset --
         # the shot point swings around the car. While coasting the velocity
@@ -653,12 +681,7 @@ class RelativePositionController(Node):
             ff_vx += rot_x
             ff_vy += rot_y
         cmd = self.pid.update(ex, ey, ez, eyaw, now, ff_vx=ff_vx, ff_vy=ff_vy)
-
-        msg.twist.linear.x = cmd.vx
-        msg.twist.linear.y = cmd.vy
-        msg.twist.linear.z = cmd.vz
-        msg.twist.angular.z = cmd.yaw_rate
-        self.vel_pub.publish(msg)
+        self._send_velocity(msg, (cmd.vx, cmd.vy, cmd.vz, cmd.yaw_rate), now)
 
         self._log_row(
             now, "coast" if coasting else "stage2", drone_xyz,
@@ -667,27 +690,135 @@ class RelativePositionController(Node):
             (cmd.vx, cmd.vy, cmd.vz, cmd.yaw_rate),
         )
 
+    # ------------------------------------------------------------------
+    # MPC
+    # ------------------------------------------------------------------
+    def _init_mpc(self):
+        cfg = self.cfg
+        try:
+            try:
+                from .drone_mpc import DroneMPC
+                from .mpc_tracker import MpcTracker
+            except ImportError:
+                from drone_mpc import DroneMPC
+                from mpc_tracker import MpcTracker
+            self.get_logger().info("MPC: loading the acados solver (first run generates + compiles, ~1 min)...")
+            mpc = DroneMPC(
+                horizon_sec=cfg.mpc_horizon_sec, n_steps=int(cfg.mpc_steps),
+                build_dir=os.path.expanduser(cfg.mpc_build_dir),
+                w_radial=cfg.mpc_w_position, w_tangential=cfg.mpc_w_position,
+                w_height=cfg.mpc_w_height, w_yaw=cfg.mpc_w_yaw, yaw_band_deg=cfg.mpc_band_angle_deg,
+                r_du_xy=cfg.mpc_r_velocity_change, r_du_z=cfg.mpc_r_vertical_change,
+                r_du_yaw=cfg.mpc_r_yaw_rate_change, terminal_factor=cfg.mpc_terminal_factor,
+                v_max_xy=cfg.pid_max_speed_xy, v_max_z=cfg.pid_max_speed_z,
+                yaw_rate_max=cfg.mpc_yaw_rate_max, accel_max_xy=cfg.pid_max_accel_xy,
+                accel_max_z=cfg.pid_max_accel_z, yaw_accel_max=cfg.mpc_yaw_accel_max,
+            )
+            self.mpc_tracker = MpcTracker(
+                mpc,
+                delays=(cfg.mpc_delay_xy_sec, cfg.mpc_delay_z_sec, cfg.mpc_delay_yaw_sec),
+                taus=(cfg.mpc_tau_xy_sec, cfg.mpc_tau_z_sec, cfg.mpc_tau_yaw_sec),
+                r_min=cfg.mpc_min_range, band_radial=cfg.mpc_band_radial,
+                band_angle_deg=cfg.mpc_band_angle_deg, band_tangential_floor=cfg.mpc_band_tangential_floor,
+                sigma0=cfg.mpc_sigma0, yaw_hold_radius=cfg.yaw_hold_radius,
+                brake_decel=cfg.mpc_car_brake_decel, car_accel=cfg.mpc_car_accel,
+                car_max_speed=cfg.kf_max_target_speed, scenario_window_sec=cfg.mpc_scenario_window_sec,
+            )
+            self.get_logger().info(
+                f"MPC ready: {mpc.N} steps x {mpc.dt:.2f} s, solver in {mpc.work_dir}"
+                + (f" (built in {mpc.build_seconds:.0f} s)" if mpc.build_seconds else "")
+            )
+        except Exception as exc:     # no acados, build failure, ...: fly the PID
+            self.mpc_tracker = None
+            self.get_logger().error(f"MPC unavailable ({type(exc).__name__}: {exc}); using the PID.")
+
+    def _on_drone_velocity(self, msg: TwistStamped):
+        v = msg.twist.linear
+        self._drone_vel = np.array([v.x, v.y, v.z])
+        self._drone_yaw_rate = float(msg.twist.angular.z)
+        self.have_drone_vel = True
+
+    def _send_velocity(self, msg: TwistStamped, cmd, now: float, from_mpc: bool = False):
+        """Publish [vx vy vz yaw_rate] and remember it: the MPC predicts the
+        drone through its ~0.8 s delay with every command actually sent,
+        whoever sent it."""
+        msg.twist.linear.x, msg.twist.linear.y, msg.twist.linear.z = (float(c) for c in cmd[:3])
+        msg.twist.angular.z = float(cmd[3])
+        self.vel_pub.publish(msg)
+        self._last_cmd = np.array(cmd, dtype=float)
+        if self.mpc_tracker is not None and not from_mpc:
+            self.mpc_tracker.record(now, self._last_cmd)
+
+    def _mpc_command(self, now, coasting, shot_offset, drone_xyz):
+        """One MPC solve. Car prediction at the stage times (predict_horizon):
+        the CTRA EKF rolled forward while tracking, the coast prediction
+        (turn fading, then slowing to a stop) while coasting. Shot offsets from the planner's preview (the
+        shot clock stands still while coasting). None -> use the PID."""
+        if not self.have_drone_vel or self.detection is None:
+            return None
+        cfg, tr, target, det = self.cfg, self.mpc_tracker, self.estimator, self.detection
+        times = tr.stage_times(now)
+        n1 = len(times)
+        xs, ys, psi, sigma = predict_horizon(target, det, times, coasting, self._coast_params(),
+                                             cfg.mpc_turn_fade_sec)
+        car_xy = np.c_[xs, ys]
+        if coasting:
+            offsets = [shot_offset] * n1
+        else:
+            offsets = self.cinematic_planner.preview(self._shot_clock(now) + (times - now))
+        off = np.array([[o.x, o.y, o.z] for o in offsets])
+        z_ref = np.full(n1, self._coast_z) if coasting else cfg.shot_ground_z + off[:, 2]
+        x_meas = np.r_[drone_xyz, self._drone_vel, self._drone_yaw(), self._drone_yaw_rate]
+        try:
+            scen = None if coasting else range_scenarios(
+                target, det, times, now, cfg.mpc_car_brake_decel, cfg.mpc_car_accel, cfg.kf_max_target_speed)
+            cmd, info = tr.command(now, x_meas, car_xy, target.z, psi, sigma, off, z_ref,
+                                   car_speed=math.hypot(target.vx, target.vy), scenarios=scen)
+        except Exception as exc:
+            self.get_logger().error(f"MPC solve raised {type(exc).__name__}: {exc}", throttle_duration_sec=2.0)
+            tr.reset()
+            return None
+        # acados: 0 ok; 2 (max iterations) is normal for one RTI step.
+        if info["status"] not in (0, 2) or not np.all(np.isfinite(cmd)):
+            self._mpc_failures += 1
+            self.get_logger().warning(
+                f"MPC status {info['status']} ({self._mpc_failures} so far); PID this cycle.",
+                throttle_duration_sec=1.0,
+            )
+            tr.reset(now, self._last_cmd)
+            return None
+        self.get_logger().info(
+            f"MPC solve {info['solve_ms']:.1f} ms, cmd=({cmd[0]:.1f}, {cmd[1]:.1f}, {cmd[2]:.1f}) m/s, "
+            f"yaw rate {math.degrees(cmd[3]):.0f} deg/s",
+            throttle_duration_sec=2.0,
+        )
+        return cmd
+
     def _publish_search_setpoint(self, now: float, drone_xyz, msg: TwistStamped):
         """SEARCH: climb to search_altitude where the search started, facing
-        the last target estimate (the gimbal sweeps around it)."""
+        the last target estimate (the gimbal sweeps around it). After
+        search_timeout_sec without finding the car, end the flight."""
         self._enter_search_mode()
+        searched = now - self._search_start_time
+        if self.cfg.search_timeout_sec > 0.0 and searched >= self.cfg.search_timeout_sec:
+            mode = str(self.cfg.search_timeout_action).upper()
+            self.flight.end_flight(
+                mode, f"no target found after searching for {searched:.0f} s"
+            )
+            self._log_row(now, "search", drone_xyz, drone_xyz, (0.0, 0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0))
+            return
         drone_x, drone_y, drone_z = drone_xyz
         hold_x, hold_y = self._search_hold_xy
         desired_z = self.cfg.shot_ground_z + self.cfg.search_altitude
         ex, ey, ez = hold_x - drone_x, hold_y - drone_y, desired_z - drone_z
         eyaw = 0.0
         if self.target_received:
-            target_x, target_y, _, _ = self._predicted_target(now)
+            target_x, target_y = self._predicted_target(now)[:2]
             if math.hypot(target_x - drone_x, target_y - drone_y) >= self.cfg.yaw_hold_radius:
                 desired_yaw = math.atan2(target_y - drone_y, target_x - drone_x)
                 eyaw = wrap_to_pi(desired_yaw - self._drone_yaw())
         cmd = self.pid.update(ex, ey, ez, eyaw, now)
-
-        msg.twist.linear.x = cmd.vx
-        msg.twist.linear.y = cmd.vy
-        msg.twist.linear.z = cmd.vz
-        msg.twist.angular.z = cmd.yaw_rate
-        self.vel_pub.publish(msg)
+        self._send_velocity(msg, (cmd.vx, cmd.vy, cmd.vz, cmd.yaw_rate), now)
         self._log_row(
             now, "search", drone_xyz, (hold_x, hold_y, desired_z),
             (ex, ey, ez, math.degrees(eyaw)),
@@ -708,6 +839,9 @@ class RelativePositionController(Node):
         # detection arrives the gimbal holds.
         d = self.detection
         if d is not None and now - d.received_time <= self.cfg.gimbal_detection_timeout_sec:
+            if self.coast_scan is not None:
+                self.coast_scan.reset()
+                self._coast_scan_time = None
             if d.received_time != self._gimbal_used_detection:
                 cmd = self.gimbal_ctrl.update_image_pd(
                     cam_x=d.cam_x, cam_y=d.cam_y, cam_z=d.cam_z,
@@ -727,14 +861,24 @@ class RelativePositionController(Node):
 
         # 3. Detection stale but the target estimate is still fresh: point at
         # where the car is predicted to be now (absolute, so it can't drift)
-        # to re-acquire it.
+        # to re-acquire it -- sweeping the yaw around it once the prediction
+        # is too uncertain for the camera's view (CoastScan).
         drone_x, drone_y, drone_z = self._drone_xyz()
-        target_x, target_y, target_z, _ = self._predicted_target(now)
+        target_x, target_y, target_z = self._predicted_target(now)[:3]
         cmd = self.gimbal_ctrl.update(
             drone_x=drone_x, drone_y=drone_y, drone_z=drone_z, drone_yaw=self._drone_yaw(),
             target_x=target_x, target_y=target_y, target_z=target_z,
         )
-        self.gimbal.send(cmd.pitch, cmd.yaw, now)
+        yaw = cmd.yaw
+        if self.coast_scan is not None and d is not None:
+            dt = 0.0 if self._coast_scan_time is None else now - self._coast_scan_time
+            self._coast_scan_time = now
+            sigma = float(predict_car(self.estimator, d, [now], self._coast_params())[3][0])
+            offset = self.coast_scan.update(
+                dt, sigma, math.hypot(target_x - drone_x, target_y - drone_y))
+            # Gimbal yaw is positive to the right, world azimuth to the left.
+            yaw = max(-self.gimbal_ctrl.max_yaw, min(self.gimbal_ctrl.max_yaw, cmd.yaw - offset))
+        self.gimbal.send(cmd.pitch, yaw, now)
 
     def _search_sweep(self, now: float):
         """Sweep the gimbal around the last target estimate (or, before any
@@ -745,7 +889,7 @@ class RelativePositionController(Node):
         phase = 2.0 * math.pi * (t / max(1.0, cfg.search_gimbal_period_sec))
         if self.target_received:
             drone_x, drone_y, drone_z = self._drone_xyz()
-            target_x, target_y, target_z, _ = self._predicted_target(now)
+            target_x, target_y, target_z = self._predicted_target(now)[:3]
             aim = self.gimbal_ctrl.update(
                 drone_x=drone_x, drone_y=drone_y, drone_z=drone_z, drone_yaw=self._drone_yaw(),
                 target_x=target_x, target_y=target_y, target_z=target_z,
