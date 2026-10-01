@@ -1,0 +1,144 @@
+<?xml version="1.0" ?>
+<sdf version="1.9">
+  <world name="iris_oval_trees_long_exp">
+    <physics name="1ms" type="ignore">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+    </physics>
+
+    <plugin filename="gz-sim-physics-system"
+      name="gz::sim::systems::Physics">
+    </plugin>
+    <plugin
+      filename="gz-sim-sensors-system"
+      name="gz::sim::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+    <plugin filename="gz-sim-user-commands-system"
+      name="gz::sim::systems::UserCommands">
+    </plugin>
+    <plugin filename="gz-sim-scene-broadcaster-system"
+      name="gz::sim::systems::SceneBroadcaster">
+    </plugin>
+    <plugin filename="gz-sim-imu-system"
+      name="gz::sim::systems::Imu">
+    </plugin>
+    <plugin filename="gz-sim-navsat-system"
+      name="gz::sim::systems::NavSat">
+    </plugin>
+
+    <scene>
+      <ambient>1.0 1.0 1.0</ambient>
+      <background>0.8 0.8 0.8</background>
+      <sky></sky>
+    </scene>
+
+    <spherical_coordinates>
+      <latitude_deg>-35.363262</latitude_deg>
+      <longitude_deg>149.165237</longitude_deg>
+      <elevation>584</elevation>
+      <heading_deg>0</heading_deg>
+      <surface_model>EARTH_WGS84</surface_model>
+    </spherical_coordinates>
+
+    <light type="directional" name="sun">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 10 0 0 0</pose>
+      <diffuse>0.8 0.8 0.8 1</diffuse>
+      <specular>0.8 0.8 0.8 1</specular>
+      <attenuation>
+        <range>1000</range>
+        <constant>0.9</constant>
+        <linear>0.01</linear>
+        <quadratic>0.001</quadratic>
+      </attenuation>
+      <direction>-0.5 0.1 -0.9</direction>
+    </light>
+
+    
+    <!-- Flat ground: the track mesh has no floor, cars drive on this plane. -->
+    <model name="ground_plane">
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <plane><normal>0 0 1</normal><size>3000 3000</size></plane>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <plane><normal>0 0 1</normal><size>3000 3000</size></plane>
+          </geometry>
+          <material>
+            <ambient>0.3 0.3 0.3 1</ambient>
+            <diffuse>0.3 0.3 0.3 1</diffuse>
+            <specular>0.05 0.05 0.05 1</specular>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <include>
+      <!-- Iris + real 3-axis gimbal (repo models/iris_with_dope_gimbal).
+           Named iris_with_gimbal so gz topics keep that model name. -->
+      <uri>model://iris_with_dope_gimbal_exp</uri>
+      <name>iris_with_gimbal</name>
+      <pose degrees="true">0 0 0.195 0 0 90</pose>
+    </include>
+
+    <!-- <include>
+      <uri>model://X1</uri>
+      <name>LandingVehicle</name>
+      <pose degrees="true">0 3 0.195 0 0 90</pose>
+    </include> -->
+    
+    <include>
+      <uri>model://audi_r8</uri>
+      <name>LandingVehicle</name>
+      <pose degrees="true">0 20 0.15 0 0 90</pose>
+    </include>
+
+    <!-- Tree clusters (long: 60 m each, 9 m outside the lane on both straights) from tools/build_experiment_assets.py; visual only. -->
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_0</name><pose>9.00 90.00 0 0 0 0.000</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_1</name><pose>9.00 96.67 0 0 0 0.700</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_2</name><pose>9.00 103.33 0 0 0 1.400</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_3</name><pose>9.00 110.00 0 0 0 2.100</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_4</name><pose>9.00 116.67 0 0 0 2.800</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_5</name><pose>9.00 123.33 0 0 0 3.500</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_6</name><pose>9.00 130.00 0 0 0 4.200</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_7</name><pose>9.00 136.67 0 0 0 4.900</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_8</name><pose>9.00 143.33 0 0 0 5.600</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_9</name><pose>9.00 150.00 0 0 0 0.017</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_10</name><pose>9.00 230.00 0 0 0 0.717</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_11</name><pose>9.00 236.67 0 0 0 1.417</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_12</name><pose>9.00 243.33 0 0 0 2.117</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_13</name><pose>9.00 250.00 0 0 0 2.817</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_14</name><pose>9.00 256.67 0 0 0 3.517</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_15</name><pose>9.00 263.33 0 0 0 4.217</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_16</name><pose>9.00 270.00 0 0 0 4.917</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_17</name><pose>9.00 276.67 0 0 0 5.617</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_18</name><pose>9.00 283.33 0 0 0 0.034</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_19</name><pose>9.00 290.00 0 0 0 0.734</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_20</name><pose>-189.00 110.00 0 0 0 1.434</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_21</name><pose>-189.00 103.33 0 0 0 2.134</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_22</name><pose>-189.00 96.67 0 0 0 2.834</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_23</name><pose>-189.00 90.00 0 0 0 3.534</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_24</name><pose>-189.00 83.33 0 0 0 4.234</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_25</name><pose>-189.00 76.67 0 0 0 4.934</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_26</name><pose>-189.00 70.00 0 0 0 5.634</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_27</name><pose>-189.00 63.33 0 0 0 0.051</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_28</name><pose>-189.00 56.67 0 0 0 0.751</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_29</name><pose>-189.00 50.00 0 0 0 1.451</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_30</name><pose>-189.00 -30.00 0 0 0 2.151</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_31</name><pose>-189.00 -36.67 0 0 0 2.851</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_32</name><pose>-189.00 -43.33 0 0 0 3.551</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_33</name><pose>-189.00 -50.00 0 0 0 4.251</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_34</name><pose>-189.00 -56.67 0 0 0 4.951</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_35</name><pose>-189.00 -63.33 0 0 0 5.651</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_36</name><pose>-189.00 -70.00 0 0 0 0.068</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_37</name><pose>-189.00 -76.67 0 0 0 0.768</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_38</name><pose>-189.00 -83.33 0 0 0 1.468</pose></include>
+    <include><uri>model://veg_tree_2</uri><name>veg_tree_2_39</name><pose>-189.00 -90.00 0 0 0 2.168</pose></include>
+
+  </world>
+</sdf>

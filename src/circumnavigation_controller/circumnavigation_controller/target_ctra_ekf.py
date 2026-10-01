@@ -150,8 +150,11 @@ class TargetCTRAEKF:
         S = P[:2, :2] + np.eye(2) * pos_std ** 2
         return float(innov @ np.linalg.solve(S, innov))
 
-    def update(self, x: float, y: float, pos_std: float, psi=None):
-        """Position (and heading, if given) measurement."""
+    def update(self, x: float, y: float, pos_std: float, psi=None, hold_heading: bool = False):
+        """Position (and heading, if given) measurement. hold_heading: a
+        position-only update that leaves the heading and turn rate alone
+        (their gain rows zeroed) -- otherwise position noise on a slow car
+        turns its heading through the velocity coupling."""
         if psi is None:
             H = np.zeros((2, 6)); H[0, 0] = H[1, 1] = 1.0
             innov = np.array([x - self.s[0], y - self.s[1]])
@@ -162,6 +165,9 @@ class TargetCTRAEKF:
             R = np.diag([pos_std ** 2, pos_std ** 2, self.heading_std ** 2])
         S = H @ self.P @ H.T + R
         K = self.P @ H.T @ np.linalg.inv(S)
+        if hold_heading and psi is None:
+            K[2, :] = 0.0
+            K[4, :] = 0.0
         self.s = self.s + K @ innov
         I_KH = np.eye(6) - K @ H
         self.P = I_KH @ self.P @ I_KH.T + K @ R @ K.T   # Joseph form: stays symmetric PSD

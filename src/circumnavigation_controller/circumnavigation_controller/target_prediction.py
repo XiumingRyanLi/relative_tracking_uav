@@ -38,8 +38,13 @@ def coast_progress(dt, full_speed_sec, taper_sec):
 
 
 def base_time(detection, now):
-    """Capture time of the last detection, or its reception time if the stamp
-    is in another clock domain (use_sim_time mismatch)."""
+    """Time the estimate is valid at: the capture time of the last detection
+    (or detection.state_stamp, when that one was only used to steer the
+    gimbal), or its reception time if the stamp is in another clock domain
+    (use_sim_time mismatch)."""
+    state = getattr(detection, "state_stamp", None)
+    if state is not None and 0.0 <= now - state <= 10.0:
+        return state
     base = detection.stamp_sec
     if not 0.0 <= now - base <= now - detection.received_time + 1.0:
         base = detection.received_time

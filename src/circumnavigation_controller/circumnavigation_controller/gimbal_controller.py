@@ -33,6 +33,7 @@ class GimbalController:
         max_pitch_up_deg: float = 30.0,
         max_pitch_down_deg: float = -135.0,
         max_yaw_deg: float = 160.0,
+        nadir_band_deg: float = 25.0,
     ):
         # Gimbal command limits, radians. Match the mount (MNT1_PITCH_MIN/MAX,
         # MNT1_YAW_MIN/MAX in gazebo-iris-gimbal.parm): pitch below -90 deg
@@ -41,6 +42,13 @@ class GimbalController:
         self.max_pitch_up = math.radians(max_pitch_up_deg)
         self.max_pitch_down = math.radians(max_pitch_down_deg)
         self.max_yaw = math.radians(max_yaw_deg)
+        # Within nadir_band of straight down (pitch -90 +- band) yaw no longer
+        # moves the car across the image -- it only spins the image about
+        # its centre -- so the image yaw loop kept adding yaw for a sideways
+        # offset it could not remove: +-100..170 deg wind-up at the top of
+        # every overpass, car lost (A1 overpass runs, 2026-10-01). There the
+        # yaw is held and pitch alone (which can go past -90) follows the car.
+        self.nadir_band = math.radians(nadir_band_deg)
 
         # Image-space PD gains. Yaw is softer than pitch: the drone body also
         # turns to face the target, so both loops correct the same bearing
@@ -75,6 +83,10 @@ class GimbalController:
     @staticmethod
     def clamp(value: float, low: float, high: float) -> float:
         return max(min(value, high), low)
+
+    def near_nadir(self, pitch: float) -> bool:
+        """Camera within nadir_band of straight down."""
+        return abs(pitch + 0.5 * math.pi) < self.nadir_band
 
     def reset(self):
         self.prev_yaw_error = 0.0
@@ -113,7 +125,9 @@ class GimbalController:
             pitch_error_rate = (pitch_error - self.prev_pitch_error) / dt
 
         yaw_correction = 0.0
-        if abs(yaw_error) > self.yaw_deadband:
+        if self.near_nadir(current_pitch):
+            pass                                        # hold the yaw (see nadir_band)
+        elif abs(yaw_error) > self.yaw_deadband:
             yaw_correction = self.kp_yaw * yaw_error + self.kd_yaw * yaw_error_rate
             yaw_correction = self.clamp(yaw_correction, -self.max_yaw_step, self.max_yaw_step)
         pitch_correction = self.kp_pitch * pitch_error + self.kd_pitch * pitch_error_rate
@@ -143,7 +157,11 @@ class GimbalController:
         target_x: float,
         target_y: float,
         target_z: float,
+        current_yaw: float = None,
     ) -> GimbalCommand:
+        """Point at a world position. current_yaw given: when the target is
+        within nadir_band of straight below, keep it (the bearing to a point
+        almost underneath swings wildly and yaw does nothing useful there)."""
         
         dx = target_x - drone_x
         dy = target_y - drone_y
@@ -162,6 +180,8 @@ class GimbalController:
         # Pitch is relative to the horizon, negative = down. dz < 0 when the
         # target is below the drone, so pitch = atan2(dz, horizontal) < 0.
         gimbal_pitch = math.atan2(dz, horizontal_dist)
+        if current_yaw is not None and self.near_nadir(gimbal_pitch):
+            gimbal_yaw = self.clamp(current_yaw, -self.max_yaw, self.max_yaw)
         gimbal_pitch = self.clamp(
             gimbal_pitch,
             self.max_pitch_down,

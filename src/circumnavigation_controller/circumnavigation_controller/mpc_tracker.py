@@ -39,6 +39,8 @@ class MpcTracker:
         car_accel: float = 2.0,
         car_max_speed: float = 15.0,
         scenario_window_sec: float = 1.0,
+        max_range: float = None,
+        max_range_margin: float = 15.0,
     ):
         self.mpc = mpc
         self.delays = tuple(delays)
@@ -53,6 +55,12 @@ class MpcTracker:
         self.car_accel = car_accel
         self.car_max_speed = car_max_speed
         self.scenario_window_sec = scenario_window_sec
+        # Soft maximum horizontal range follows the shot: max(max_range,
+        # shot radius + max_range_margin), so a 45 m shot is not pulled in to
+        # 45 m. None: leave the solver's own setting alone.
+        self.max_range = max_range
+        self.max_range_margin = max_range_margin
+        self._r_max_applied = None
         self.sent = deque()        # (t_sent, [ux uy uz ur])
         self.last_info = None
 
@@ -92,6 +100,24 @@ class MpcTracker:
         accel = (0.5 * a * tau * tau if tau < t_sat
                  else 0.5 * a * t_sat * t_sat + (self.car_max_speed - speed) * (tau - t_sat))
         return brake, max(0.0, accel)
+
+    def range_limit(self, offsets):
+        """Maximum horizontal range for this plan: max(max_range, largest
+        horizontal shot radius over the horizon + margin); 0 = off."""
+        if self.max_range is None or self.max_range <= 0.0:
+            return 0.0
+        off = np.asarray(offsets, dtype=float)
+        r_shot = float(np.max(np.hypot(off[:, 0], off[:, 1]))) if len(off) else 0.0
+        return max(self.max_range, r_shot + self.max_range_margin)
+
+    def _update_range_limit(self, offsets):
+        if self.max_range is None:
+            return
+        r_max = self.range_limit(offsets)
+        # Only touch the solver when it changes (it rewrites every stage's bounds).
+        if self._r_max_applied is None or abs(r_max - self._r_max_applied) > 0.5:
+            self.mpc.set_max_range(r_max)
+            self._r_max_applied = r_max
 
     def stage_parameters(self, car_xy, car_z, car_psi, sigma, offsets, z_ref, car_speed=0.0, scenarios=None):
         """(N+1, NP) parameters. car_xy (N+1, 2), car_z scalar or (N+1,),
@@ -142,6 +168,7 @@ class MpcTracker:
                 scenarios=None):
         """x_meas: [px py pz vx vy vz psi r] now. Returns ([ux uy uz ur], info)."""
         x0, _ = dm.propagate_delay(x_meas, list(self.sent), now, self.delays, self.taus)
+        self._update_range_limit(offsets)
         P = self.stage_parameters(car_xy, car_z, car_psi, sigma, offsets, z_ref, car_speed, scenarios)
         cmd, info = self.mpc.solve(x0, P)
         info["x0"] = x0

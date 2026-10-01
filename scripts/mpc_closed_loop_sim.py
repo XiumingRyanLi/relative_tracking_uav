@@ -62,6 +62,7 @@ from pid_controller import PIDRelativeController                                
 from drone_mpc import DroneMPC                                                       # noqa: E402
 from mpc_tracker import MpcTracker                                                   # noqa: E402
 from target_prediction import CoastParams, CoastScan, predict_car, predict_horizon, range_scenarios  # noqa: E402
+from cinematic_planner import CinematicPlanner                                       # noqa: E402
 
 DT_SIM, DT_CTRL, DT_DET = 0.01, 0.05, 1.0 / 15.0
 DELAYS = (0.8, 0.7, 0.25)
@@ -73,6 +74,20 @@ HALF_FOV = (math.radians(23.0), math.radians(13.0))
 GIMBAL_RATE = math.radians(40.0)
 LATENCY = 0.07
 COAST_AFTER = 0.5                        # feedforward_timeout_sec
+# DOPE's heading seen from steeply above (A1 overpass runs, 2026-10-01: 15-27 deg
+# off, one 149 deg flip): extra noise + flips past OVERHEAD_ELEV_DEG.
+OVERHEAD_ELEV_DEG = 60.0
+OVERHEAD_HEADING_SD = math.radians(18.0)  # a bias drifting over OVERHEAD_TAU (the A1 estimate sat 15-27 deg off)
+OVERHEAD_TAU = 1.5
+OVERHEAD_FLIP_PROB = 0.05
+HEADING_MAX_ELEV_DEG = 60.0              # node: heading_max_elevation_deg (90 = always use the heading)
+STEEP_POS_NOISE_SCALE = 3.0              # node: steep_pos_noise_scale (1 = off)
+STEEP_SKIP_ELEV_DEG = 70.0               # node: steep_skip_elevation_deg (90 = off)
+# DOPE position seen from steeply above: an extra drifting error, ~3 m when
+# looking nearly straight down (A1 estimates: 0.7 m below 20 deg, 1.5 m at
+# 60-70, 3.1 m above 80 deg).
+OVERHEAD_POS_SD = 2.5
+OVERHEAD_POS_TAU = 0.7
 
 VARIANTS = {
     "pid":       dict(controller="pid", coast=CoastParams(3.0, 1.0, 40.0, 1.5), reacquire=5.0, timeout=5.0, window=-1.0, accel=False),
@@ -151,9 +166,21 @@ class Gimbal:
         self.el += float(np.clip(el - self.el, -step, step))
 
     def sees(self, drone_p, car_xy):
+        """Car inside the camera's +-23 x +-13 deg view, measured in the
+        camera frame. (Comparing azimuths directly, as this did until
+        2026-10-01, is far too strict looking steeply down -- at -63 deg the
+        +-23 deg view spans +-51 deg of azimuth -- and made up misses on
+        every overpass.)"""
         d = np.r_[car_xy - drone_p[:2], CAR_Z - drone_p[2]]
-        az, el = math.atan2(d[1], d[0]), math.atan2(d[2], np.hypot(d[0], d[1]))
-        return abs(wrap(az - self.az)) <= HALF_FOV[0] and abs(el - self.el) <= HALF_FOV[1]
+        ca, sa, ce, se = math.cos(self.az), math.sin(self.az), math.cos(self.el), math.sin(self.el)
+        fwd = np.array([ce * ca, ce * sa, se])
+        right = np.array([sa, -ca, 0.0])
+        up = np.cross(right, fwd)
+        f = float(d @ fwd)
+        if f <= 0.0:
+            return False
+        return (abs(math.atan2(float(d @ right), f)) <= HALF_FOV[0]
+                and abs(math.atan2(float(d @ up), f)) <= HALF_FOV[1])
 
 
 SCALE_PYRAMID = [0.16, 0.2, 0.24, 0.28, 0.34, 0.4, 0.48, 0.556, 0.7]
@@ -196,15 +223,31 @@ class ScaledSpline:
         return self.spline(np.asarray(t) * self.k, nu) * self.k ** nu
 
 
-def run(variant, world, seconds, seed, mpc, occlusions, speed_scale=1.0, trace=None):
+def run(variant, world, seconds, seed, mpc, occlusions, speed_scale=1.0, trace=None, truth=None, shot_seq=None):
+    """truth: optional (spline, t_end, psi_fn or None) instead of the world's
+    racing line (scripts/feasibility_check.py: launch / sine paths). shot_seq:
+    optional shot sequence (cinematic actions, as the controller's
+    shot_sequence) flown through CinematicPlanner instead of the fixed OFFSET;
+    its clock stands still while coasting, like the node's."""
     cfg = VARIANTS[variant]
-    spline, t_end = race_truth(world)
+    psi_fn = None
+    if truth is not None:
+        spline, t_end, psi_fn = truth
+    else:
+        spline, t_end = race_truth(world)
     if speed_scale != 1.0:
         spline, t_end = ScaledSpline(spline, speed_scale), t_end / speed_scale
     t_end = min(t_end - 3.0, seconds + 3.0)
     rs = np.random.default_rng(seed)
-    car_psi_at = lambda t: math.atan2(*spline(t, 1)[::-1])
+    car_psi_at = psi_fn or (lambda t: math.atan2(*spline(t, 1)[::-1]))
     t = 2.0
+    planner = None
+    shot_paused, coast_since = 0.0, None
+    if shot_seq:
+        planner = CinematicPlanner()
+        planner.set_sequence(shot_seq)
+        o = planner.update(t)
+        OFFSET[:] = (o.x, o.y, o.z)
     plant = Plant(shot_point(spline(t), car_psi_at(t)), car_psi_at(t))
     gimbal = Gimbal()
     scan = CoastScan(**cfg["scan"]) if cfg.get("scan") is not None else None
@@ -223,11 +266,13 @@ def run(variant, world, seconds, seed, mpc, occlusions, speed_scale=1.0, trace=N
     if cfg["controller"] == "mpc":
         mpc.set_max_range(cfg.get("max_range", 0.0))
         wr, wt = cfg.get("w", (30.0, 30.0))
-        mpc.set_weights(wr, wt, 5.0, 10.0, 10.0, 0.1, 1.0, 2.0, 2.0)
-        tracker = MpcTracker(mpc, DELAYS, TAUS, scenario_window_sec=cfg["window"])
+        rxy, rz, ryaw = cfg.get("du", (0.1, 1.0, 2.0))        # mpc_r_velocity / vertical / yaw_rate_change
+        mpc.set_weights(wr, wt, 5.0, 10.0, 10.0, rxy, rz, ryaw, 2.0)
+        tracker = MpcTracker(mpc, DELAYS, TAUS, scenario_window_sec=cfg["window"],
+                             max_range=cfg.get("max_range", 0.0))
         tracker.reset()
     blk = blackouts(t, t_end, seed) if occlusions else []
-    bias, hb = np.zeros(2), 0.0
+    bias, hb, ob, opb = np.zeros(2), 0.0, 0.0, np.zeros(2)
     det = None
     dope_frame, dope_last = 0, -1e9       # DOPE's own frame counter / last detection time
     next_det = next_ctrl = t
@@ -269,7 +314,23 @@ def run(variant, world, seconds, seed, mpc, occlusions, speed_scale=1.0, trace=N
                 psi = psi_cap + hb + math.radians(2.0) * rs.standard_normal()
                 if rng > 40.0 and rs.random() < 0.03:
                     psi += math.pi
-                if est.update(pose_matrix(xy[0], xy[1], wrap(psi)), rng, cap) is None:
+                elev = math.degrees(math.atan2(plant.p[2] - CAR_Z, float(np.hypot(*(c_cap - plant.p[:2])))))
+                ap_ = math.exp(-DT_DET / OVERHEAD_POS_TAU)
+                opb = ap_ * opb + math.sqrt(1 - ap_ * ap_) * OVERHEAD_POS_SD * rs.standard_normal(2)
+                ao = math.exp(-DT_DET / OVERHEAD_TAU)
+                ob = ao * ob + math.sqrt(1 - ao * ao) * OVERHEAD_HEADING_SD * rs.standard_normal()
+                if elev > OVERHEAD_ELEV_DEG:
+                    psi += ob
+                    xy = xy + opb * min(1.0, (elev - OVERHEAD_ELEV_DEG) / (90.0 - OVERHEAD_ELEV_DEG))
+                    if rs.random() < OVERHEAD_FLIP_PROB:
+                        psi += math.pi
+                steep = elev > HEADING_MAX_ELEV_DEG
+                last_up = est.last_update_stamp
+                if elev > STEEP_SKIP_ELEV_DEG and last_up is not None and 0.0 <= cap - last_up <= cfg["reacquire"] - 0.5:
+                    # node: steers the gimbal, keeps the target seen, estimate predicts through
+                    det = SimpleNamespace(stamp_sec=cap, received_time=t, state_stamp=last_up)
+                elif est.update(pose_matrix(xy[0], xy[1], wrap(psi)), rng, cap, use_heading=not steep,
+                                pos_noise_scale=STEEP_POS_NOISE_SCALE if steep else 1.0) is None:
                     det = SimpleNamespace(stamp_sec=cap, received_time=t)
                     for i, (a0, b0) in enumerate(blk):
                         st = blk_state[i]
@@ -293,6 +354,15 @@ def run(variant, world, seconds, seed, mpc, occlusions, speed_scale=1.0, trace=N
                 seed_car(t)
                 age = 0.0
             coasting = age > COAST_AFTER
+            if planner is not None:
+                if coasting and coast_since is None:
+                    coast_since = t
+                elif not coasting and coast_since is not None:
+                    shot_paused += t - coast_since
+                    coast_since = None
+                clock = t - shot_paused - (t - coast_since if coast_since is not None else 0.0)
+                o = planner.update(clock)
+                OFFSET[:] = (o.x, o.y, o.z)
             cp = cfg["coast"]
             xs, ys, psi_now, sig_now, rate = predict_car(est, det, [t], cp)
             az_off = 0.0
@@ -311,15 +381,20 @@ def run(variant, world, seconds, seed, mpc, occlusions, speed_scale=1.0, trace=N
                 times = tracker.stage_times(t)
                 hx, hy, hpsi, hsig = predict_horizon(est, det, times, coasting, cp, cfg.get("track_fade", 0.0))
                 n1 = len(times)
+                if planner is not None and not coasting:
+                    offs = np.array([[q.x, q.y, q.z] for q in planner.preview(clock + (times - t))])
+                else:
+                    offs = np.tile(OFFSET, (n1, 1))
                 x_meas = np.r_[plant.p, plant.v, plant.psi, plant.r]
                 scen = None if coasting else range_scenarios(est, det, times, t)
                 cmd, info = tracker.command(t, x_meas, np.c_[hx, hy], CAR_Z, hpsi, hsig,
-                                            np.tile(OFFSET, (n1, 1)), np.full(n1, OFFSET[2]),
+                                            offs, offs[:, 2].copy(),
                                             car_speed=math.hypot(est.vx, est.vy), scenarios=scen)
                 m["ms"].append(info["solve_ms"])
             plant.command(t, cmd)
             if t > 12.0:
                 m["du"].append(np.hypot(*(cmd[:2] - prev[:2])) / DT_CTRL)
+                m.setdefault("dyaw", []).append(abs(cmd[3] - prev[3]) / DT_CTRL)
             # blackout just ended: score the prediction there
             for i, (a0, b0) in enumerate(blk):
                 if blk_state[i] is None and t >= b0:
@@ -332,8 +407,11 @@ def run(variant, world, seconds, seed, mpc, occlusions, speed_scale=1.0, trace=N
             sp = shot_point(car_p, car_psi)
             d = plant.p[:2] - car_p
             m["err"].append(float(np.hypot(*(plant.p[:2] - sp[:2]))))
-            rad_s = np.hypot(*d) - math.hypot(OFFSET[0], OFFSET[1])
-            ang_s = math.degrees(wrap(math.atan2(d[1], d[0]) - (car_psi + math.atan2(OFFSET[1], OFFSET[0]))))
+            r_off = math.hypot(OFFSET[0], OFFSET[1])
+            rad_s = np.hypot(*d) - r_off
+            # Nearly overhead (overpass) the bearing round the car means nothing.
+            ang_s = (math.degrees(wrap(math.atan2(d[1], d[0]) - (car_psi + math.atan2(OFFSET[1], OFFSET[0]))))
+                     if r_off > 5.0 else 0.0)
             m["rad"].append(abs(rad_s))
             m["ang"].append(abs(ang_s))
             if trace is not None:

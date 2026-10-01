@@ -41,6 +41,10 @@ class Detection:
     world_yaw: float        # target heading in world ENU from its orientation (rad)
     stamp_sec: float        # frame capture time
     received_time: float    # node time the detection was accepted
+    # Time the target estimate was last updated, if not this frame's (a
+    # steep-view detection that only steers the gimbal, see the node's
+    # steep_skip_elevation_deg); predictions run from here.
+    state_stamp: Optional[float] = None
 
 
 class TargetEstimator:
@@ -178,20 +182,33 @@ class TargetEstimator:
     def reject_count(self) -> int:
         return self._reject_count
 
+    @property
+    def last_update_stamp(self) -> Optional[float]:
+        """Capture time of the last detection folded into the CTRA filter."""
+        return self._ctra_last_update_time if self.use_ctra and self.ctra.initialized else None
+
     def raw_heading(self, T_world_target: np.ndarray) -> float:
         """World yaw of the detector frame's heading axis."""
         axis = T_world_target[:3, self.heading_axis]
         return math.atan2(axis[1], axis[0])
 
-    def update(self, T_world_target: np.ndarray, distance: float, stamp_sec: float) -> Optional[str]:
+    def update(self, T_world_target: np.ndarray, distance: float, stamp_sec: float,
+               use_heading: bool = True, pos_noise_scale: float = 1.0) -> Optional[str]:
         """Fold in one detection. Returns None if accepted, else why it was rejected.
 
         stamp_sec is the frame's capture time (not reception time), so detection
         latency jitter doesn't show up in the velocity as spurious acceleration.
+        use_heading=False (CTRA filter): position only, the detector's heading
+        is not used -- e.g. looking almost straight down, where DOPE's heading
+        was 15-27 deg off and once flipped (A1 overpass runs, 2026-10-01).
+        Ignored when the filter has to (re)start: it needs some heading.
+        pos_noise_scale: multiplies the detection's position std (steep views:
+        the A1 overpass estimates were ~3 m off above 80 deg).
         """
         meas = T_world_target[:3, 3].copy()
         if self.use_ctra:
-            return self._update_ctra_pipeline(T_world_target, meas, distance, stamp_sec)
+            return self._update_ctra_pipeline(T_world_target, meas, distance, stamp_sec, use_heading,
+                                              pos_noise_scale)
         kf_fresh = (
             self._kf_last_update_time is not None
             and (stamp_sec - self._kf_last_update_time) <= self.kf_coast_timeout_sec
@@ -272,7 +289,8 @@ class TargetEstimator:
             return wrap_to_pi(raw_heading + math.pi)
         return raw_heading
 
-    def _update_ctra_pipeline(self, T_world_target, meas, distance, stamp_sec) -> Optional[str]:
+    def _update_ctra_pipeline(self, T_world_target, meas, distance, stamp_sec, use_heading=True,
+                              pos_noise_scale=1.0) -> Optional[str]:
         """target_filter=ctra: the CTRA EKF alone, no CV KF.
 
         1. gate: range, then a chi-square gate on the EKF's own predicted
@@ -290,7 +308,7 @@ class TargetEstimator:
             self._reject_count += 1
             return f"range {distance:.1f} m outside [{self.min_distance:.1f}, {self.max_distance:.1f}]"
         ekf = self.ctra
-        r_std = self.kf.r_std + self.noise_per_m * distance
+        r_std = (self.kf.r_std + self.noise_per_m * distance) * max(pos_noise_scale, 1.0)
         last = self._ctra_last_update_time
         gap = stamp_sec - last if last is not None else math.inf
         # Short gaps (the car behind a tree): predict through them and gate
@@ -321,8 +339,11 @@ class TargetEstimator:
             denom = float(t @ t)
             course_velocity = (float(t @ w[:, 1]) / denom, float(t @ w[:, 2]) / denom)
 
-        raw_heading = wrap_to_pi(self.raw_heading(T_world_target))
-        raw_heading = self._resolve_flip_ctra(raw_heading, stamp_sec, gap, reseed, course_velocity)
+        if use_heading or not (fresh and not reseed and ekf.initialized):
+            raw_heading = wrap_to_pi(self.raw_heading(T_world_target))
+            raw_heading = self._resolve_flip_ctra(raw_heading, stamp_sec, gap, reseed, course_velocity)
+        else:
+            raw_heading = None          # position-only update; flip check / start-up votes untouched
         self._update_ctra(meas, r_std, raw_heading, fresh and not reseed, stamp_sec)
         self.z = float(meas[2]) if not fresh else self.z + self.z_alpha * (float(meas[2]) - self.z)
         self.vz = 0.0
@@ -385,7 +406,9 @@ class TargetEstimator:
         else:
             ekf.predict(stamp_sec - self._ctra_last_update_time)
             psi = raw_heading
-            if abs(angle_diff(raw_heading, ekf.heading)) > self.max_heading_jump:
+            if raw_heading is None:
+                pass                                   # position only (use_heading=False)
+            elif abs(angle_diff(raw_heading, ekf.heading)) > self.max_heading_jump:
                 self._heading_reject_count += 1
                 psi = None
             else:
@@ -394,7 +417,8 @@ class TargetEstimator:
                 ekf.reset(float(meas[0]), float(meas[1]), raw_heading, ekf.speed, speed_std=3.0)
                 self._heading_reject_count = 0
             else:
-                ekf.update(float(meas[0]), float(meas[1]), pos_std, psi)
+                # Position-only (use_heading=False): keep the heading as it was.
+                ekf.update(float(meas[0]), float(meas[1]), pos_std, psi, hold_heading=raw_heading is None)
         # A filter pinned at the reverse-speed limit is a forward-driving car
         # with its heading 180 deg wrong: turn it round. Only once it has
         # settled (1 s after a (re)start or turn-round) and stays pinned for
@@ -403,7 +427,10 @@ class TargetEstimator:
         # follows (earlier votes were against the old heading).
         if not fresh or self._ctra_start_time is None:
             self._ctra_start_time = stamp_sec
-        pinned = ekf.speed <= -(ekf.max_reverse_speed - 0.5)
+        # Only with a heading measurement: on position-only (steep view)
+        # updates a pinned speed is position noise, not a flipped heading
+        # (A1 overpass rep02 re-run: the guard turned a parked car round).
+        pinned = raw_heading is not None and ekf.speed <= -(ekf.max_reverse_speed - 0.5)
         self._reverse_pinned = self._reverse_pinned + 1 if pinned else 0
         if self._reverse_pinned >= 3 and stamp_sec - self._ctra_start_time > 1.0:
             ekf.turn_round()

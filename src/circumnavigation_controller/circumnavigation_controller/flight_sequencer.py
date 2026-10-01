@@ -106,6 +106,7 @@ class FlightSequencer:
                     self._on_tracking_enabled()
                 self.tracking_enabled = True
                 self._log.info("Tracking enabled.")
+                self._log.info("EXPERIMENT_EVENT tracking_enabled")
 
     def _request_guided(self):
         if not self.set_mode_client.wait_for_service(timeout_sec=0.5):
@@ -192,6 +193,7 @@ class FlightSequencer:
         self.rtl_initiated = True
         self.tracking_enabled = False
         self._log.warning(f"{mode}: {reason}")
+        self._log.info(f"EXPERIMENT_EVENT flight_end {mode}: {reason}")
 
         if not self.set_mode_client.wait_for_service(timeout_sec=1.0):
             self._log.error(f"SetMode service not ready for {mode}.")

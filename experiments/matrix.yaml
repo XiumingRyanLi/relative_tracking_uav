@@ -1,0 +1,131 @@
+# Experiment matrix for scripts/run_experiments.py (expanded there; see
+# `python3 scripts/run_experiments.py --dry-run` for the full run list).
+#
+# Every run is one headless Gazebo launch (sim_launch.py headless:=true):
+# takeoff, tracking, the shot, then the end condition of its car mode:
+#   parked : car never moves; the controller LANDs after `duration` s
+#   race   : race_driver drives `laps` lap(s) of the world's racing line
+#            capped at `speed`; the run ends when it stops
+#   launch : race_driver's launch profile on the flat field, 0 -> speed at
+#            launch_accel, hold launch_hold s, brake at launch_brake
+#
+# Car paths (`paths`, every block with a moving car runs each):
+#   line : the racing line (race) / the straight start line (launch)
+#   sine : the same with a sine weave on top, the same everywhere: +-
+#          sine_amplitude (3 m) with peak lateral acceleration sine_lat_accel
+#          (2 m/s^2) at every speed, i.e. one weave per 2 pi sqrt(A / a) =
+#          7.7 s at the speed cap (wavelength = speed x 7.7 s), ramping in
+#          over a quarter wavelength. On Silverstone (lane ~9.8 m wide) it
+#          is also cut to the room to the walls minus sine_wall_clearance.
+#          Run names: _sine.
+# Within a shot: line then sine, each fastest speed first, then down.
+# A search timeout (car lost, LAND) also ends a run (status "lost").
+#
+# Shots (scripts/run_experiments.py: shot_sequence()):
+#   behind/front/left/right : hold at that side at `radius`, `height`
+#   orbit    : 360 deg counter-clockwise orbits from behind, repeated, each
+#              2*pi*r / orbit_speed s; constant speed round a parked car
+#              (A1), eased in/out each lap round a moving one
+#   overpass : behind -> front -> behind ... over the car, each pass
+#              2*r / overpass_speed s, peak overpass_peak m
+#   weave    : the drone weaves: from behind, a sine sideways along the circle
+#              round the car (radius kept), +-weave_amplitude m, one cycle
+#              per weave_period s (peak 4.7 m/s relative to the car);
+#              fading in / out over half a period
+#   showcase : follow (behind 20 s) -> orbit -> move to front -> lead (front
+#              20 s) -> overpass to behind, repeated
+#
+# No wind. Camera Gaussian noise (stddev 0.01) in every run, built into the
+# *_exp drone model by tools/build_experiment_assets.py.
+
+defaults:
+  detector: dope
+  controller: mpc
+  radius: 20.0
+  height: 4.0
+  repeats: 5
+  laps: 1
+  orbit_speed: 5.7          # m/s round the car
+  overpass_speed: 3.0       # m/s over the car
+  overpass_peak: 15.0       # m
+  weave_axis: around        # around | radial | vertical
+  weave_amplitude: 6.0      # m (arc length for around)
+  weave_period: 8.0         # s
+  launch_accel: 8.0
+  launch_hold: 10.0
+  launch_brake: 6.0
+  paths: [line, sine]
+  sine_amplitude: 3.0       # m either side of the line
+  sine_lat_accel: 2.0       # m/s^2 peak lateral acceleration of the weave
+  sine_wall_clearance: 2.0  # m line-to-wall, as the racing line keeps (car half width ~1 m + 1 m)
+
+blocks:
+  A1:
+    description: static car, every shot
+    world: iris_silverstone_exp
+    car: parked
+    duration: 60
+    repeats: 2              # static car: little run-to-run variation
+    shots: [behind, front, left, right, orbit, overpass, weave]
+
+  A2:
+    description: speed sweep, one lap of Silverstone, every shot
+    world: iris_silverstone_exp
+    car: race
+    speeds: [5, 8, 11, 13, 15, 17]
+    repeats: 3              # trimmed: 5 only at the headline / failure speeds
+    repeats_by_speed: {11: 5, 15: 5, 17: 5}
+    shots: [behind, front, left, right, orbit, overpass, weave]
+
+  A3:
+    description: radius sweep at 11 m/s (20 m is A2's 11 m/s runs)
+    world: iris_silverstone_exp
+    car: race
+    speeds: [11]
+    repeats: 3
+    radii: [12, 28, 35, 45]
+    shots: [behind, front, left, right, orbit, overpass, weave]
+
+  A4:
+    description: straight-line launch / brake on the flat field
+    world: iris_flat_exp
+    car: launch
+    speeds: [8, 13, 17]
+    shots: [behind, front, right, orbit, overpass, weave]
+    # orbit / overpass start when the car sets off (phase-locked)
+    shot_start_speed: 0.5
+    extra:
+      - {shot: left, speed: 13, repeats: 2}
+
+  A5:
+    description: headline configurations to 10 repeats (runs 6-10; 1-5 are in A2)
+    # EDIT after A2: pick the configurations the paper leads with.
+    world: iris_silverstone_exp
+    car: race
+    first_rep: 6
+    runs:
+      - {shot: behind, speed: 13}
+      - {shot: right, speed: 11}
+      - {shot: orbit, speed: 11}
+
+  showcase:
+    description: follow -> orbit -> lead -> overpass at 11 m/s
+    world: iris_silverstone_exp
+    car: race
+    speeds: [11]
+    shots: [showcase]
+    repeats: 3
+
+  B1:
+    description: controlled occlusion, tree clusters between the car and a right-side shot
+    worlds: [iris_oval_trees_short_exp, iris_oval_trees_medium_exp, iris_oval_trees_long_exp]
+    car: race
+    speeds: [5, 11, 15]
+    shots: [right]
+
+  B2:
+    description: realistic occlusion, Silverstone with trees
+    world: iris_silverstone_trees_exp
+    car: race
+    speeds: [8, 11, 15]
+    shots: [behind, right]

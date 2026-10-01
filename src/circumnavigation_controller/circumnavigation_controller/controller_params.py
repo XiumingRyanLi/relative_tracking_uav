@@ -29,15 +29,16 @@ PARAMETERS = [
     ("mpc_horizon_sec", 2.0, "MPC prediction horizon (s). Changing it regenerates the solver."),
     ("mpc_steps", 20, "MPC steps over the horizon. Changing it regenerates the solver."),
     ("mpc_build_dir", "~/.ros/drone_mpc", "Where the generated acados solver is kept (reused across runs)."),
-    ("mpc_w_radial", 90.0,
+    ("mpc_w_radial", 80.0,
      "Weight on the distance to the car vs the shot radius, divided by mpc_band_radial. Higher "
      "than mpc_w_tangential = keep the distance (and the car in DOPE's range) first, let the angle "
      "round the car catch up later. Offline, right shot, car below the drone's top speed: "
      "90/10 held the distance 92 % of the time (30/30: 67 %), never too close (7 %), angle slips "
      "back within 10 deg in a median 3.5 s; behind shot in band 36 vs 39 %."),
-    ("mpc_w_tangential", 10.0,
+    ("mpc_w_tangential", 20.0,
      "Weight on the angle round the car (as the chord r x |unit(drone - car) - unit(shot - car)|), "
-     "divided by radius x mpc_band_angle_deg."),
+     "divided by radius x mpc_band_angle_deg. 80/20 since 2026-10-01 (offline sweep: within noise "
+     "of 90/10 on band time, angle held slightly better at 11 m/s)."),
     ("mpc_band_radial", 5.0, "Radial band half-width: distance to the car within the shot radius +- this (m)."),
     ("mpc_band_angle_deg", 10.0,
      "Angular band half-width around the car (deg); also the yaw error that costs w_yaw."),
@@ -45,9 +46,12 @@ PARAMETERS = [
      "Tangential band never narrower than this (m), so the angle term fades out for overhead shots."),
     ("mpc_w_height", 5.0, "Weight on the height error (per m)."),
     ("mpc_w_yaw", 10.0, "Weight on facing the car (a yaw error of mpc_band_angle_deg costs this)."),
-    ("mpc_r_velocity_change", 0.1, "Weight on horizontal command changes (smooth commands)."),
+    ("mpc_r_velocity_change", 1.0,
+     "Weight on horizontal command changes (per m/s^2). Was 0.1: with a parked car the command still "
+     "changed at 3.5-4 m/s^2 (chasing detection noise, A1 runs); 1.0 cut that ~40 % offline with the "
+     "same or slightly better tracking."),
     ("mpc_r_vertical_change", 1.0, "Weight on vertical command changes."),
-    ("mpc_r_yaw_rate_change", 2.0, "Weight on yaw-rate command changes."),
+    ("mpc_r_yaw_rate_change", 10.0, "Weight on yaw-rate command changes (per rad/s^2); was 2."),
     ("mpc_terminal_factor", 2.0, "Terminal-stage multiplier on the tracking weights."),
     ("mpc_sigma0", 5.0,
      "Position weight at stage k = 1 / (1 + (sigma_k / sigma0)^2), sigma_k the predicted car "
@@ -82,6 +86,9 @@ PARAMETERS = [
      "drone can fly (18 m right of a car in a long left turn needs ~2x its speed) the MPC gives "
      "up shot accuracy to keep the car detectable (DOPE to ~80 m) and cuts inside. Run "
      "20260929_124410 lost the car at 80 m chasing a right-side shot round a left turn."),
+    ("mpc_max_range_margin", 15.0,
+     "The maximum range follows the shot: max(mpc_max_range, shot radius + this margin) (m), "
+     "so a 45 m shot gets 60 m instead of being pulled in to 45 m."),
 
     # ---- Drone position loop ----
     ("shot_ground_z", 0.0,
@@ -238,6 +245,19 @@ PARAMETERS = [
      "Lowest gimbal pitch command (deg); -90 is straight down, below that looks backwards. "
      "Mount limit MNT1_PITCH_MIN is -135 (was -80 in code, so it could never look straight down)."),
     ("gimbal_max_pitch_up_deg", 30.0, "Highest gimbal pitch command (deg); mount allows 45."),
+    ("heading_max_elevation_deg", 60.0,
+     "Detections seen more steeply below than this update the car's position only, not its "
+     "heading: from overhead DOPE's heading was 15-27 deg off (once flipped) and swung the shot "
+     "frame 3-7 m sideways in the A1 overpasses (deg; 90 = always use the heading)."),
+    ("steep_skip_elevation_deg", 70.0,
+     "Detections seen more steeply than this only steer the gimbal (and keep the target seen); the "
+     "estimate predicts through them: DOPE's position was ~3 m off above 80 deg (deg; 90 = off)."),
+    ("steep_pos_noise_scale", 3.0,
+     "Position std multiplier for detections seen more steeply than heading_max_elevation_deg: the "
+     "A1 overpass position estimates were ~3 m off above 80 deg (0.7 m in normal views)."),
+    ("gimbal_nadir_band_deg", 25.0,
+     "Within this of straight down the gimbal yaw is held and pitch alone follows the car: yaw only "
+     "spins the image there, and the image loop wound it up +-170 deg in the A1 overpasses (deg)."),
     ("gimbal_max_yaw_deg", 160.0, "Gimbal yaw command limit (deg, +- about the nose); mount limit 160 (was 90)."),
     ("yaw_hold_radius", 5.0,
      "Hold the drone's body yaw while it is within this horizontal distance (m) of the target: "
@@ -293,6 +313,18 @@ PARAMETERS = [
      "A new sequence first flies around the car from the current shot point to its start "
      "point at this speed relative to the car (m/s); jumping there cut past the car."),
     ("shot_transition_min_sec", 2.0, "Shortest such transition (s)."),
+
+    # ---- Experiments (scripts/run_experiments.py) ----
+    ("shot_sequence", "",
+     "Shot sequence as a JSON list of actions (cinematic_action_schema.py); empty = "
+     "DEFAULT_SHOT_SEQUENCE in relative_position_controller.py."),
+    ("run_name", "",
+     "CSV log name: <run_name>.csv; empty = relative_pid_<timestamp>.csv."),
+    ("experiment_duration_sec", 0.0,
+     "End the flight (LAND) this long after the shot sequence started (s, sim time); 0 = off."),
+    ("shot_start_speed", 0.0,
+     "Hold the shot sequence at its start until the car's ground-truth speed exceeds this (m/s), "
+     "e.g. to start an overpass/orbit when a car launches; 0 = start with tracking."),
 
     # ---- Evaluation inputs (logged only) ----
     ("truth_target_odom_topic", "/landing_vehicle/odometry",

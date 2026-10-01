@@ -5,3 +5,7 @@ log/
 *.pth
 __pycache__/
 *.pyc
+
+# Experiment outputs (scripts/run_experiments.py); experiments/matrix.yaml is tracked
+experiments/*/
+experiments/batch.log

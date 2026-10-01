@@ -34,20 +34,30 @@ CSV_HEADER = [
     "car_gt_x", "car_gt_y", "car_gt_z", "car_gt_yaw_deg", "car_gt_lat", "car_gt_lon",
     "gt_dist_m", "dope_dist_err_m", "dope_pos_err_m", "dope_yaw_err_deg",
     "dope_cam_x", "dope_cam_y", "dope_cam_z",
+    # ---- experiment columns ----
+    # shot offset in the car frame (+x front, +y left, z above shot_ground_z)
+    # and the shot clock (s since the sequence started, paused while coasting)
+    "shot_ox", "shot_oy", "shot_oz", "shot_clock",
+    "car_gt_speed", "mpc_r_max",
+    # header stamp of the car_gt_* odometry (sim s): the truth arrives slower
+    # than the rows, so interpolate it by this stamp, not by "time"
+    "car_gt_stamp",
 ]
 
 
 class RunLogger:
-    def __init__(self, logger, world_origin_lat: float, world_origin_lon: float):
+    def __init__(self, logger, world_origin_lat: float, world_origin_lon: float, run_name: str = ""):
         self._log = logger
         self.world_origin_lat = world_origin_lat
         self.world_origin_lon = world_origin_lon
         # Evaluation inputs (not used for control).
         self.truth_car = None   # (x, y, z, yaw_rad) world ENU, from Gazebo
         self.gps = None         # (lat, lon, alt)
+        self.truth_speed = None  # m/s, from the same odometry
+        self.truth_stamp = None  # its header stamp, s
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.filename = f"relative_pid_{ts}.csv"
+        self.filename = f"{run_name}.csv" if run_name else f"relative_pid_{ts}.csv"
         self._file = open(self.filename, "w", newline="")
         self._writer = csv.writer(self._file)
         self._writer.writerow(CSV_HEADER)
@@ -58,6 +68,9 @@ class RunLogger:
         q = msg.pose.pose.orientation
         yaw = tf_transformations.euler_from_quaternion([q.x, q.y, q.z, q.w])[2]
         self.truth_car = (float(p.x), float(p.y), float(p.z), float(yaw))
+        v = msg.twist.twist.linear
+        self.truth_speed = math.hypot(float(v.x), float(v.y))
+        self.truth_stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
 
     def on_gps(self, msg):
         self.gps = (float(msg.latitude), float(msg.longitude), float(msg.altitude))
@@ -75,6 +88,8 @@ class RunLogger:
         target,             # TargetEstimator
         detection,          # Detection or None
         drone_yaw_deg,      # None without a drone pose
+        shot=None,          # (ox, oy, oz, shot_clock) or None
+        mpc_r_max=None,
     ):
         dx, dy, dz = drone_xyz
         self._writer.writerow([
@@ -86,6 +101,8 @@ class RunLogger:
             *command,
             *gimbal_rpy_deg,
             *self._eval_columns(now, drone_xyz, target, detection, drone_yaw_deg),
+            *(shot if shot is not None else (None,) * 4),
+            self.truth_speed, mpc_r_max, self.truth_stamp,
         ])
         self._file.flush()
 

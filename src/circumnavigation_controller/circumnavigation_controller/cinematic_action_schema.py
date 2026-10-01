@@ -35,6 +35,16 @@ FIELD_SPECS = {
     # (any location; the short way if it lies on neither side).
     "via":          {"kind": "location", "default": "left"},
     "direction":    {"kind": "enum", "options": ("clockwise", "counterclockwise"), "default": "clockwise"},
+    # smooth: ease in and out (starts and stops at rest); linear: constant
+    # speed -- for chained orbits, which otherwise stop behind the car every
+    # lap (A1 orbit runs: drone speed swung 1-11 m/s for a 5.7 m/s orbit).
+    "easing":       {"kind": "enum", "options": ("smooth", "linear"), "default": "smooth"},
+    # weave: a sine on top of the base shot point. around = sideways along
+    # the circle round the car (radius kept; amplitude is arc length),
+    # radial = in and out, vertical = up and down.
+    "axis":         {"kind": "enum", "options": ("around", "radial", "vertical"), "default": "around"},
+    "amplitude":    {"kind": "float", "bounds": (0.5, 20.0), "default": 6.0, "unit": " m"},
+    "period":       {"kind": "float", "bounds": (2.0, 60.0), "default": 8.0, "unit": " s"},
     # Distance limits: DOPE was trained on 4-45 m views, so shots out to
     # ~50 m stay detectable (was capped at 15 m radius / 20 m height, which
     # also stopped typing larger values in the GUI). The planner still keeps
@@ -63,12 +73,16 @@ ACTION_SCHEMA = {
         "duration_default": 8.0,
     },
     "orbit": {
-        "fields": ["start", "radius", "height", "angle_deg", "direction", "duration"],
+        "fields": ["start", "radius", "height", "angle_deg", "direction", "easing", "duration"],
         "duration_default": 10.0,
     },
     "overpass": {
         "fields": ["from", "to", "radius", "start_height", "peak_height", "end_height", "duration"],
         "duration_default": 12.0,
+    },
+    "weave": {
+        "fields": ["location", "radius", "height", "axis", "amplitude", "period", "duration"],
+        "duration_default": 24.0,
     },
     "push_in": {
         "fields": ["location", "height", "near_radius", "far_radius", "duration"],
@@ -87,14 +101,16 @@ FIELD_LABELS = {
     "radius": "Radius", "height": "Height", "start_height": "Start height",
     "peak_height": "Peak height", "end_height": "End height",
     "near_radius": "Near radius", "far_radius": "Far radius",
-    "angle_deg": "Angle", "direction": "Direction", "duration": "Duration",
+    "angle_deg": "Angle", "direction": "Direction", "easing": "Easing", "axis": "Weave axis",
+    "amplitude": "Amplitude", "period": "Period", "duration": "Duration",
 }
 
 # Canonical row order for the GUI form (superset of every action's fields).
 FIELD_ORDER = [
     "location", "from", "to", "via", "start",
     "radius", "height", "start_height", "peak_height", "end_height",
-    "near_radius", "far_radius", "angle_deg", "direction", "duration",
+    "near_radius", "far_radius", "angle_deg", "direction", "easing",
+    "axis", "amplitude", "period", "duration",
 ]
 
 

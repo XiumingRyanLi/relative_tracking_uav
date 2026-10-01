@@ -8,6 +8,7 @@ from collections import deque
 # sim camera (straight down, the 4.4 m car spans the 26 deg direction: >= 9.4 m).
 MIN_TARGET_RANGE = 10.0
 CAR_CENTRE_Z = 0.6          # DOPE box centre above the ground (m)
+MIN_SHOT_HEIGHT = 2.0       # weave never takes the shot below this (the MPC's altitude floor)
 
 @dataclass
 class CinematicOffset:
@@ -158,8 +159,10 @@ class CinematicPlanner:
         u = elapsed / duration
         u = max(0.0, min(1.0, u))
 
-        # Optional smoothing for cinematic motion
-        s = u * u * (3.0 - 2.0 * u)
+        # Smooth (ease in / out) by default; "easing": "linear" keeps a
+        # constant speed (chained orbits).
+        s = (u if action.get("easing") == "linear" or action.get("type") == "weave"
+             else u * u * (3.0 - 2.0 * u))
 
         offset = self._offset(action, s)
         self._has_flown = True
@@ -205,6 +208,8 @@ class CinematicPlanner:
             offset = self._orbit(action, s)
         elif action_type == "overpass":
             offset = self._overpass(action, s)
+        elif action_type == "weave":
+            offset = self._weave(action, s)
         elif action_type == "push_in":
             offset = self._push_pull(action, s, push=True)
         elif action_type == "pull_out":
@@ -317,6 +322,32 @@ class CinematicPlanner:
         z = base_z + arc * (peak_height - max(start_height, end_height))
 
         return CinematicOffset(x, y, z)
+
+    def _weave(self, action: dict, s: float) -> CinematicOffset:
+        """Sine weave on top of a held shot point (s = elapsed / duration,
+        linear): `axis` around (sideways along the circle round the car, the
+        radius kept; amplitude = arc length), radial (in / out) or vertical
+        (up / down), `amplitude` m, one cycle per `period` s. The amplitude
+        fades in over the first half period and out over the last, so the
+        shot starts and ends at rest on the base point."""
+        radius = float(action.get("radius", self.default_radius))
+        height = float(action.get("height", self.default_height))
+        amp = float(action.get("amplitude", 6.0))
+        period = max(float(action.get("period", 8.0)), 1e-3)
+        duration = max(float(action.get("duration", 1.0)), 1e-3)
+        t = s * duration
+        half = min(0.5 * period, 0.5 * duration)
+        env = self.smoothstep(min(t, duration - t) / half) if half > 0 else 1.0
+        w = env * amp * math.sin(2.0 * math.pi * t / period)
+        theta = self._bearing(action.get("location", "back"))
+        axis = action.get("axis", "around")
+        if axis == "around":
+            theta += w / max(radius, 0.5)
+        elif axis == "radial":
+            radius = max(radius + w, 0.5)
+        else:
+            height = max(height + w, MIN_SHOT_HEIGHT)
+        return CinematicOffset(radius * math.cos(theta), radius * math.sin(theta), height)
 
     def _push_pull(self, action: dict, s: float, push: bool) -> CinematicOffset:
         location = action.get("location", "back")

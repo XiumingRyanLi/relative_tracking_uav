@@ -47,10 +47,12 @@ def wrap(a):
     return (a + math.pi) % (2.0 * math.pi) - math.pi
 
 
-def race_truth(world):
-    """spline(t) -> car xy (spline(t, 1) velocity, (t, 2) acceleration)."""
-    pts = np.loadtxt(os.path.join(PKG, "config", "race_lines", f"{world}.csv"), delimiter=",", comments="#")
-    line = RaceLine(pts)
+def race_truth(world, csv=None, **line_kwargs):
+    """spline(t) -> car xy (spline(t, 1) velocity, (t, 2) acceleration).
+    csv: a racing-line file instead of the world's; line_kwargs go to
+    RaceLine (e.g. max_speed=17)."""
+    pts = np.loadtxt(csv or os.path.join(PKG, "config", "race_lines", f"{world}.csv"), delimiter=",", comments="#")
+    line = RaceLine(pts, **line_kwargs)
     xy = np.vstack([line.pts[-20:], line.pts, line.pts[:20]])
     xy = savgol_filter(xy, 15, 3, axis=0)[20:-20]          # smooth the ~1 m points
     closed = np.vstack([xy, xy[:1]])

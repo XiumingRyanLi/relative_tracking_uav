@@ -158,12 +158,13 @@ class RelativePositionController(Node):
             max_pitch_up_deg=cfg.gimbal_max_pitch_up_deg,
             max_pitch_down_deg=cfg.gimbal_max_pitch_down_deg,
             max_yaw_deg=cfg.gimbal_max_yaw_deg,
+            nadir_band_deg=cfg.gimbal_nadir_band_deg,
         )
         self.cinematic_planner = CinematicPlanner(
             transition_speed=cfg.shot_transition_speed,
             transition_min_sec=cfg.shot_transition_min_sec,
         )
-        self.cinematic_planner.set_sequence(DEFAULT_SHOT_SEQUENCE)
+        self.cinematic_planner.set_sequence(self._initial_shot_sequence())
         self.estimator = TargetEstimator(
             heading_axis={"x": 0, "y": 1, "z": 2}[str(cfg.target_heading_axis).lower()],
             min_distance=cfg.min_visual_target_distance,
@@ -225,7 +226,8 @@ class RelativePositionController(Node):
             initial_pitch_rad=math.radians(cfg.gimbal_initial_pitch_deg),
             history_sec=cfg.pose_history_buffer_sec,
         )
-        self.run_log = RunLogger(self.get_logger(), cfg.world_origin_lat_deg, cfg.world_origin_lon_deg)
+        self.run_log = RunLogger(self.get_logger(), cfg.world_origin_lat_deg, cfg.world_origin_lon_deg,
+                                 run_name=str(cfg.run_name))
 
         # ---------------- State ----------------
         self.drone_pose = PoseStamped()
@@ -243,6 +245,10 @@ class RelativePositionController(Node):
         self._coast_start_time = None   # set while coasting through a target loss
         self._coast_z = None            # drone height held while coasting
         self._shot_paused_sec = 0.0     # coasting time kept off the shot clock
+        self._shot_hold_since = None    # shot_start_speed: waiting for the car since
+        self._shot_started_time = None  # when the shot sequence started (experiment_duration_sec)
+        self._shot_clock_at_start = 0.0
+        self._shot_log = None           # (ox, oy, oz, shot clock) of the last setpoint, for the CSV
 
         # ---------------- Subscriptions ----------------
         reliable_qos = QoSProfile(
@@ -304,6 +310,50 @@ class RelativePositionController(Node):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+    def _initial_shot_sequence(self):
+        """shot_sequence parameter (JSON, validated like a GUI command), else
+        DEFAULT_SHOT_SEQUENCE."""
+        raw = str(self.cfg.shot_sequence).strip()
+        if not raw:
+            return DEFAULT_SHOT_SEQUENCE
+        actions = json.loads(raw)        # a bad experiment config should fail loudly
+        if not isinstance(actions, list) or not actions:
+            raise ValueError("shot_sequence must be a non-empty JSON list of actions")
+        validated = []
+        for i, a in enumerate(actions):
+            v = validate_action(a, i, warn=self.get_logger().warning)
+            if v is None:
+                raise ValueError(f"shot_sequence[{i}] is not a valid action: {a!r}")
+            validated.append(v)
+        self.get_logger().info(f"Shot sequence from the shot_sequence parameter: {json.dumps(validated)}")
+        return validated
+
+    def _shot_waiting(self, now: float) -> bool:
+        """shot_start_speed: True while the shot sequence waits at its start
+        for the car to set off (its clock is kept still, like while coasting)."""
+        if self._shot_started_time is not None:
+            return False
+        speed = self.run_log.truth_speed
+        if self.cfg.shot_start_speed > 0.0 and (speed is None or speed < self.cfg.shot_start_speed):
+            if self._shot_hold_since is None:
+                self._shot_hold_since = now
+                self.get_logger().info(
+                    f"Shot sequence waiting for the car to exceed {self.cfg.shot_start_speed:.1f} m/s.")
+            return True
+        if self._shot_hold_since is not None:
+            self._shot_paused_sec += now - self._shot_hold_since
+            self._shot_hold_since = None
+        self._shot_started_time = now
+        self._shot_clock_at_start = self._shot_clock(now)
+        self.get_logger().info("EXPERIMENT_EVENT shot_start")
+        return False
+
+    def _check_experiment_end(self, now: float):
+        d = self.cfg.experiment_duration_sec
+        if d > 0.0 and self._shot_started_time is not None and now - self._shot_started_time >= d:
+            self.get_logger().info("EXPERIMENT_EVENT duration_done")
+            self.flight.end_flight("LAND", f"experiment duration {d:.0f} s reached")
+
     def _now(self) -> float:
         return self.get_clock().now().nanoseconds / 1e9
 
@@ -369,10 +419,13 @@ class RelativePositionController(Node):
         return lost
 
     def _shot_clock(self, now: float) -> float:
-        """Time for the cinematic planner: stands still while coasting."""
+        """Time for the cinematic planner: stands still while coasting (and
+        while waiting for the car, shot_start_speed)."""
         paused = self._shot_paused_sec
         if self._coast_start_time is not None:
             paused += now - self._coast_start_time
+        if self._shot_hold_since is not None:
+            paused += now - self._shot_hold_since
         return now - paused
 
     def _coast_params(self) -> CoastParams:
@@ -397,6 +450,8 @@ class RelativePositionController(Node):
         self.run_log.log(
             now, stage, drone_xyz, desired_xyz, errors, command,
             self.gimbal.attitude_rpy_deg(), self.estimator, self.detection, self._drone_yaw_deg(),
+            shot=self._shot_log,
+            mpc_r_max=(self.mpc_tracker._r_max_applied if self.mpc_tracker is not None else None),
         )
 
     # ------------------------------------------------------------------
@@ -521,7 +576,26 @@ class RelativePositionController(Node):
         distance = math.sqrt(p_cam.x ** 2 + p_cam.y ** 2 + p_cam.z ** 2)
         flips_before = self.estimator.heading_flips
         state_flips_before = self.estimator.ctra.state_flips
-        reject_reason = self.estimator.update(T_world_target, distance, stamp_sec)
+        # Steep views: DOPE's heading is unreliable past heading_max_elevation_deg
+        # (position only, with a wider position noise), and nearly straight
+        # down (steep_skip_elevation_deg) its position too -- ~3 m off above 80
+        # deg; folded in, a parked car picked up 4 m/s and the coast prediction
+        # drove it away (A1 overpass re-runs). There the detection only steers
+        # the gimbal and keeps the target "seen"; the estimate predicts through
+        # (at most ctra_reacquire_sec - 0.5 s, then it is used regardless).
+        dp = T_world_target[:3, 3] - T_world_camera[:3, 3]
+        elevation = math.degrees(math.atan2(-dp[2], math.hypot(dp[0], dp[1])))
+        use_heading = elevation <= self.cfg.heading_max_elevation_deg
+        last_update = self.estimator.last_update_stamp
+        state_stamp = None
+        if (elevation > self.cfg.steep_skip_elevation_deg and last_update is not None
+                and 0.0 <= stamp_sec - last_update <= self.cfg.ctra_reacquire_sec - 0.5):
+            reject_reason = None
+            state_stamp = last_update
+        else:
+            reject_reason = self.estimator.update(
+                T_world_target, distance, stamp_sec, use_heading=use_heading,
+                pos_noise_scale=1.0 if use_heading else self.cfg.steep_pos_noise_scale)
         if self.estimator.ctra.state_flips != state_flips_before:
             self.get_logger().warning(
                 "Target filter was pinned at the reverse-speed limit: a forward car with a flipped "
@@ -548,6 +622,7 @@ class RelativePositionController(Node):
             world_yaw=float(self.estimator.raw_heading(T_world_target)),
             stamp_sec=float(stamp_sec),
             received_time=now,
+            state_stamp=state_stamp,
         )
         if self.cfg.debug_transform_chain:
             self.run_log.log_chain_debug(
@@ -625,7 +700,13 @@ class RelativePositionController(Node):
         # latency). The shot height is flown above the ground, not above
         # target.z: the car is on the ground, and target.z is a noisy estimate
         # of its box centre (~0.6 m up) that the altitude would otherwise chase.
-        shot_offset = self.cinematic_planner.update(self._shot_clock(now))
+        self._shot_waiting(now)
+        self._check_experiment_end(now)
+        shot_clock = self._shot_clock(now)
+        shot_offset = self.cinematic_planner.update(shot_clock)
+        t0 = self._shot_started_time
+        self._shot_log = (shot_offset.x, shot_offset.y, shot_offset.z,
+                          0.0 if t0 is None else shot_clock - self._shot_clock_at_start)
         # Coasting: the heading follows the prediction (the car may be turning
         # behind the obstacle); no extra yaw-rate lead.
         yaw_rate = 0.0 if coasting else target.yaw_rate
@@ -736,6 +817,7 @@ class RelativePositionController(Node):
                 sigma0=cfg.mpc_sigma0, yaw_hold_radius=cfg.yaw_hold_radius,
                 brake_decel=cfg.mpc_car_brake_decel, car_accel=cfg.mpc_car_accel,
                 car_max_speed=cfg.kf_max_target_speed, scenario_window_sec=cfg.mpc_scenario_window_sec,
+                max_range=cfg.mpc_max_range, max_range_margin=cfg.mpc_max_range_margin,
             )
             self.get_logger().info(
                 f"MPC ready: {mpc.N} steps x {mpc.dt:.2f} s, solver in {mpc.work_dir}"
@@ -775,7 +857,8 @@ class RelativePositionController(Node):
         xs, ys, psi, sigma = predict_horizon(target, det, times, coasting, self._coast_params(),
                                              cfg.mpc_turn_fade_sec)
         car_xy = np.c_[xs, ys]
-        if coasting:
+        if coasting or self._shot_hold_since is not None:
+            # The shot clock stands still (coasting, or waiting for the car to set off).
             offsets = [shot_offset] * n1
         else:
             offsets = self.cinematic_planner.preview(self._shot_clock(now) + (times - now))
@@ -881,6 +964,7 @@ class RelativePositionController(Node):
         cmd = self.gimbal_ctrl.update(
             drone_x=drone_x, drone_y=drone_y, drone_z=drone_z, drone_yaw=self._drone_yaw(),
             target_x=target_x, target_y=target_y, target_z=target_z,
+            current_yaw=self.gimbal.current_yaw,
         )
         yaw = cmd.yaw
         if self.coast_scan is not None and d is not None:
