@@ -1,0 +1,142 @@
+<mxfile host="app.diagrams.net">
+  <diagram id="system-overview" name="System overview">
+    <mxGraphModel dx="1000" dy="600" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="900" pageHeight="380" math="1" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <!-- perception group (drawn first so it sits behind the blocks) -->
+        <mxCell id="grp" value="Perception &amp;amp; estimation" style="rounded=1;arcSize=6;dashed=1;fillColor=none;strokeColor=#999999;fontSize=9;fontColor=#808080;verticalLabelPosition=top;verticalAlign=bottom;html=1;" vertex="1" parent="1">
+          <mxGeometry x="185" y="25" width="670" height="80" as="geometry" />
+        </mxCell>
+
+        <!-- perception row -->
+        <mxCell id="cam" value="Gimbal camera&lt;br&gt;image \(I(t_c)\)" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="40" y="40" width="120" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="dope" value="6-DoF pose&lt;br&gt;estimator (DOPE)" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="200" y="40" width="120" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="tf" value="Camera\(\to\)world&lt;br&gt;transform" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="360" y="40" width="120" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="est" value="Target state estimator&lt;br&gt;gate · flip check · EKF" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="520" y="40" width="170" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="pred" value="Horizon&lt;br&gt;prediction" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="730" y="40" width="110" height="50" as="geometry" />
+        </mxCell>
+
+        <!-- planning / control row -->
+        <mxCell id="fc" value="Autopilot&lt;br&gt;(velocity loop)" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="40" y="170" width="120" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="gimctl" value="Gimbal&lt;br&gt;controller" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="200" y="170" width="120" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="seq" value="Mode logic&lt;br&gt;track / coast / search" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="360" y="170" width="130" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="mpc" value="MPC&lt;br&gt;(delay-compensated)" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="520" y="170" width="170" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="shot" value="Shot planner&lt;br&gt;\(\mathbf{o}(t)\)" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="730" y="170" width="110" height="50" as="geometry" />
+        </mxCell>
+
+        <!-- vehicle / operator row -->
+        <mxCell id="quad" value="Quadcopter&lt;br&gt;+ 3-axis gimbal" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="30" y="290" width="140" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="gui" value="Operator&lt;br&gt;shot sequence" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="730" y="290" width="110" height="50" as="geometry" />
+        </mxCell>
+
+        <!-- arrows: perception -->
+        <mxCell id="e1" value="\(I\)" style="edgeStyle=none;html=1;endArrow=classic;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="cam" target="dope">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e2" value="\({}^{C}\mathbf{T}_{O}\)" style="edgeStyle=none;html=1;endArrow=classic;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="dope" target="tf">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e3" value="\(\mathbf{z}\)" style="edgeStyle=none;html=1;endArrow=classic;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="tf" target="est">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e4" value="\(\hat{\mathbf{x}}_t,\mathbf{P}\)" style="edgeStyle=none;html=1;endArrow=classic;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="est" target="pred">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- prediction to planner / MPC -->
+        <mxCell id="e5" value="\(\hat{\mathbf{x}}_t(t_k)\)" style="edgeStyle=none;html=1;endArrow=classic;fontSize=10;labelBackgroundColor=#ffffff;align=left;spacingLeft=4;" edge="1" parent="1" source="pred" target="shot">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="10" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e6" value="\(\hat{\mathbf{p}}_k,\hat\psi_k,\sigma_k\)" style="edgeStyle=none;html=1;endArrow=classic;fontSize=10;labelBackgroundColor=#ffffff;exitX=0;exitY=1;exitDx=0;exitDy=0;exitPerimeter=0;entryX=1;entryY=0;entryDx=0;entryDy=0;entryPerimeter=0;" edge="1" parent="1" source="pred" target="mpc">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e7" value="\(\mathbf{p}^*_k\)" style="edgeStyle=none;html=1;endArrow=classic;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="shot" target="mpc">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e8" value="" style="edgeStyle=none;html=1;endArrow=classic;" edge="1" parent="1" source="gui" target="shot">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- control -->
+        <mxCell id="e9" value="\(\mathbf{u}\)" style="edgeStyle=none;html=1;endArrow=classic;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="mpc" target="seq">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e10" value="\(\mathbf{u}=[\mathbf{v}^c,\,r^c]\)" style="edgeStyle=none;html=1;endArrow=classic;fontSize=10;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;exitDx=0;exitDy=0;exitPerimeter=0;entryX=1;entryY=0.5;entryDx=0;entryDy=0;entryPerimeter=0;" edge="1" parent="1" source="seq" target="fc">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="425" y="240" />
+              <mxPoint x="180" y="240" />
+              <mxPoint x="180" y="195" />
+            </Array>
+            <mxPoint x="-10" y="0" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e11" value="thrust, attitude" style="edgeStyle=none;html=1;endArrow=classic;fontSize=10;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;exitDx=0;exitDy=0;exitPerimeter=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;entryPerimeter=0;" edge="1" parent="1" source="fc" target="quad">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e12" value="\(\hat{\mathbf{x}}_t\), detection age" style="edgeStyle=none;html=1;endArrow=classic;fontSize=10;labelBackgroundColor=#ffffff;exitX=0.1;exitY=1;exitDx=0;exitDy=0;exitPerimeter=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;entryPerimeter=0;" edge="1" parent="1" source="est" target="gimctl">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="537" y="130" />
+              <mxPoint x="260" y="130" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e13" value="\(\theta^c,\phi^c\)" style="edgeStyle=none;html=1;endArrow=classic;fontSize=10;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;exitDx=0;exitDy=0;exitPerimeter=0;entryX=1;entryY=0.5;entryDx=0;entryDy=0;entryPerimeter=0;" edge="1" parent="1" source="gimctl" target="quad">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="260" y="315" />
+            </Array>
+            <mxPoint x="30" y="0" as="offset" />
+          </mxGeometry>
+        </mxCell>
+
+        <!-- feedback from vehicle -->
+        <mxCell id="e14" value="image" style="edgeStyle=none;html=1;endArrow=classic;fontSize=10;labelBackgroundColor=#ffffff;exitX=0;exitY=0.5;exitDx=0;exitDy=0;exitPerimeter=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;entryPerimeter=0;" edge="1" parent="1" source="quad" target="cam">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="12" y="315" />
+              <mxPoint x="12" y="65" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e15" value="\(\mathbf{x}_d\), gimbal att." style="edgeStyle=none;html=1;endArrow=classic;dashed=1;fontSize=10;labelBackgroundColor=#ffffff;exitX=1;exitY=0;exitDx=0;exitDy=0;exitPerimeter=0;entryX=0;entryY=1;entryDx=0;entryDy=0;entryPerimeter=0;" edge="1" parent="1" source="fc" target="tf">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e16" value="\(\mathbf{x}_d\)" style="edgeStyle=none;html=1;endArrow=classic;dashed=1;fontSize=10;labelBackgroundColor=#ffffff;exitX=1;exitY=1;exitDx=0;exitDy=0;exitPerimeter=0;entryX=0.5;entryY=1;entryDx=0;entryDy=0;entryPerimeter=0;" edge="1" parent="1" source="fc" target="mpc">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="175" y="262" />
+              <mxPoint x="605" y="262" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
