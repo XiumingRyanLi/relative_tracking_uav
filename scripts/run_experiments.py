@@ -573,6 +573,8 @@ def main():
         st = json.load(open(p)).get('status')
         if st in ('done', 'lost'):
             return True
+        if st == 'interrupted':
+            return False                   # cut off by a stop: always redo
         return not args.rerun_failed       # failed runs: only again with --rerun-failed
     todo = [r for r in runs if not finished(r)]
     if args.limit:
